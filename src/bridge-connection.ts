@@ -9,11 +9,12 @@ const execFileAsync = promisify(execFile);
 export interface BridgeConnectionMetadata {
   version: 1;
   id: string;
+  name?: string;
   lanOrigins: string[];
   tailscaleOrigins: string[];
 }
 
-interface NetworkSnapshot { localHostname?: string; addresses: string[]; tailscaleAddresses: string[] }
+interface NetworkSnapshot { localHostname?: string; addresses: string[]; tailscaleAddresses: string[]; tailscaleDNSName?: string }
 
 function ipv4(address: string): number[] | undefined {
   const parts = address.split('.');
@@ -32,6 +33,13 @@ export function isTailscaleAddress(address: string): boolean {
   return !!parts && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
 }
 
+/** Accept only canonical DNS labels inside the Tailscale-controlled namespace. */
+export function canonicalTailscaleDNSName(value: unknown): string | undefined {
+  if (typeof value !== 'string') return;
+  const name = value.toLowerCase().replace(/\.$/, '');
+  return name.length <= 253 && /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.net$/.test(name) ? name : undefined;
+}
+
 /** A token-free identity proof must name an address this machine actually owns.
  * Binding the proof to that origin prevents a discovered peer from relaying a
  * challenge to the real bridge and then receiving the paired URL itself. */
@@ -44,6 +52,7 @@ export class BridgeConnection {
   }
 
   setPort(port: number) { this.port = port; }
+  get listenPort(): number { return this.port; }
 
   async metadata(): Promise<BridgeConnectionMetadata> {
     const snapshot = await this.snapshot();
@@ -51,13 +60,14 @@ export class BridgeConnection {
     const hostname = snapshot.localHostname?.toLowerCase().replace(/\.local\.?$/, '');
     const lan = snapshot.addresses.filter(isLANAddress);
     const tail = snapshot.tailscaleAddresses.filter(ip => isTailscaleAddress(ip) && snapshot.addresses.includes(ip));
+    const tailDNSName = tail.length ? canonicalTailscaleDNSName(snapshot.tailscaleDNSName) : undefined;
     return {
-      version: 1, id: this.id,
+      version: 1, id: this.id, name: snapshot.localHostname?.slice(0, 100) || 'Mac bridge',
       lanOrigins: [...new Set([
         ...(hostname && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(hostname) ? [origin(`${hostname}.local`)] : []),
         ...lan.map(origin),
       ])].slice(0, 5),
-      tailscaleOrigins: [...new Set(tail.map(origin))].slice(0, 2),
+      tailscaleOrigins: [...new Set([...(tailDNSName ? [origin(tailDNSName)] : []), ...tail.map(origin)])].slice(0, 2),
     };
   }
 
@@ -72,8 +82,8 @@ export class BridgeConnection {
 }
 
 export function installBridgeIdentityRoute(app: Express, bridge: BridgeConnection | undefined) {
-  // This is intentionally the sole token-free bridge route. It exposes neither
-  // addresses nor the bearer token, and works with REQUIRE_DEVICE_AUTH enabled.
+  // Identity challenges contain no bearer token and remain available before
+  // pairing. Discovery and pairing install their own narrower public handlers.
   app.get('/api/bridge/identity', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     if (!bridge) { res.status(404).json({ error: 'Bridge identity is unavailable.' }); return; }
@@ -87,7 +97,7 @@ export function installBridgeIdentityRoute(app: Express, bridge: BridgeConnectio
   });
 }
 
-let cachedNames: { expires: number; localHostname?: string; tailscaleAddresses: string[] } | undefined;
+let cachedNames: { expires: number; localHostname?: string; tailscaleAddresses: string[]; tailscaleDNSName?: string } | undefined;
 let namesInFlight: Promise<void> | undefined;
 
 async function refreshNames() {
@@ -95,13 +105,24 @@ async function refreshNames() {
     ? await execFileAsync('/usr/sbin/scutil', ['--get', 'LocalHostName'], { timeout: 1000, maxBuffer: 1024 }).then(result => result.stdout.trim()).catch(() => undefined)
     : undefined;
   let tailscaleAddresses: string[] = [];
-  for (const binary of ['/usr/local/bin/tailscale', '/opt/homebrew/bin/tailscale', '/usr/bin/tailscale']) {
+  let tailscaleDNSName: string | undefined;
+  for (const binary of ['/usr/local/bin/tailscale', '/opt/homebrew/bin/tailscale', '/usr/bin/tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale']) {
     if (!await access(binary).then(() => true).catch(() => false)) continue;
-    tailscaleAddresses = await execFileAsync(binary, ['ip', '-4'], { timeout: 1500, maxBuffer: 2048 })
-      .then(result => result.stdout.trim().split(/\s+/).filter(isTailscaleAddress)).catch(() => []);
+    const [addresses, status] = await Promise.all([
+      execFileAsync(binary, ['ip', '-4'], { timeout: 1500, maxBuffer: 2048 })
+        .then(result => result.stdout.trim().split(/\s+/).filter(isTailscaleAddress)).catch(() => []),
+      execFileAsync(binary, ['status', '--json'], { timeout: 1500, maxBuffer: 1_048_576 })
+        .then(result => JSON.parse(result.stdout) as unknown).catch(() => undefined),
+    ]);
+    const self = status && typeof status === 'object' && 'BackendState' in status && status.BackendState === 'Running'
+      && 'Self' in status && status.Self && typeof status.Self === 'object' ? status.Self : undefined;
+    const selfAddresses = self && 'TailscaleIPs' in self && Array.isArray(self.TailscaleIPs)
+      ? self.TailscaleIPs.filter((ip): ip is string => typeof ip === 'string' && isTailscaleAddress(ip)) : [];
+    tailscaleAddresses = selfAddresses.length ? selfAddresses : addresses;
+    tailscaleDNSName = self && 'DNSName' in self ? canonicalTailscaleDNSName(self.DNSName) : undefined;
     if (tailscaleAddresses.length) break;
   }
-  cachedNames = { expires: Date.now() + 60_000, localHostname, tailscaleAddresses };
+  cachedNames = { expires: Date.now() + 60_000, localHostname, tailscaleAddresses, tailscaleDNSName };
 }
 
 async function localNetworkSnapshot(): Promise<NetworkSnapshot> {
@@ -113,5 +134,6 @@ async function localNetworkSnapshot(): Promise<NetworkSnapshot> {
   // signed candidate after the interface has moved to another address.
   const addresses = Object.values(networkInterfaces()).flatMap(entries => entries ?? [])
     .filter(entry => entry.family === 'IPv4' && !entry.internal).map(entry => entry.address);
-  return { addresses, localHostname: cachedNames?.localHostname, tailscaleAddresses: cachedNames?.tailscaleAddresses ?? [] };
+  return { addresses, localHostname: cachedNames?.localHostname, tailscaleAddresses: cachedNames?.tailscaleAddresses ?? [],
+    tailscaleDNSName: cachedNames?.tailscaleDNSName };
 }

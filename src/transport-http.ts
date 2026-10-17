@@ -16,6 +16,8 @@ import { installControlRoutes } from './codex-execution-controls.js';
 import { ConversationError } from './codex-message-input.js';
 import { validProjectId } from './codex-projects-catalog.js';
 import { BridgeConnection, installBridgeIdentityRoute } from './bridge-connection.js';
+import { BridgeDiscovery, advertiseBridge, installBridgeDiscoveryRoute } from './bridge-discovery.js';
+import { BridgePairings, installBridgePairingRoutes } from './bridge-pairing.js';
 import type { Server } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
@@ -46,6 +48,10 @@ export async function startHttp(port: number): Promise<Server> {
   const localThreads = settings ? new CodexThreads(settings.codexPath) : undefined;
   const remoteHosts = await RemoteHosts.fromEnvironment({ bridgeSettings: settings });
   const bridgeConnection = settings ? new BridgeConnection(settings.deviceToken) : undefined;
+  const bridgeDiscovery = bridgeConnection ? new BridgeDiscovery(bridgeConnection) : undefined;
+  const bridgePairings = bridgeConnection && settings ? new BridgePairings(bridgeConnection, settings.deviceToken, {
+    onEvent: event => console.error(`[petroglyphs] Pairing ${event.event} via ${event.route}.`),
+  }) : undefined;
   let autoReply: CodexAutoReply | undefined;
   if (settings && process.env.PETROGLYPHS_LEGACY_SUBMISSIONS !== '0') {
     try { autoReply = new CodexAutoReply(settings); }
@@ -56,6 +62,8 @@ export async function startHttp(port: number): Promise<Server> {
     return autoReply;
   };
   installBridgeIdentityRoute(app, bridgeConnection);
+  installBridgeDiscoveryRoute(app, bridgeDiscovery);
+  if (bridgePairings && bridgeDiscovery) installBridgePairingRoutes(app, bridgePairings, bridgeDiscovery);
   app.use((req, res, next) => {
     if (devicePrefix && (req.path.startsWith(`${devicePrefix}/api/`) || req.path === `${devicePrefix}/mcp`)) {
       res.locals.autoReplyAuthorized = true;
@@ -401,10 +409,17 @@ export async function startHttp(port: number): Promise<Server> {
   });
 
   return new Promise((resolve, reject) => {
+    let closeAdvertisement = () => {};
+    let closed = false;
     const onListening = () => {
       const address = listener.address();
       const actualPort = typeof address === 'object' && address ? address.port : port;
       bridgeConnection?.setPort(actualPort);
+      // Ephemeral listeners are used by route tests and should not advertise a
+      // short-lived bridge to nearby devices.
+      if (bridgeConnection && port !== 0) void advertiseBridge(bridgeConnection).then(close => {
+        if (closed) close(); else closeAdvertisement = close;
+      }).catch(() => { console.error('[petroglyphs] Bonjour discovery is unavailable. Tailscale discovery remains enabled.'); });
       console.error(`[petroglyphs] HTTP server listening on http://localhost:${actualPort}`);
       console.error(`[petroglyphs]   Landing:   GET  http://localhost:${actualPort}/`);
       console.error(`[petroglyphs]   iPad API:  POST http://localhost:${actualPort}/api/submit`);
@@ -414,7 +429,13 @@ export async function startHttp(port: number): Promise<Server> {
     };
     const bindHost = process.env.PETROGLYPHS_BIND_HOST;
     const listener = bindHost ? app.listen(port, bindHost, onListening) : app.listen(port, onListening);
-    listener.once('close', () => remoteHosts.close());
-    listener.once('error', reject);
+    const closeServices = () => {
+      closed = true;
+      closeAdvertisement();
+      bridgePairings?.close();
+      remoteHosts.close();
+    };
+    listener.once('close', closeServices);
+    listener.once('error', error => { closeServices(); reject(error); });
   });
 }

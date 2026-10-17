@@ -396,13 +396,13 @@ export class CodexConversations {
     } catch { return; }
   }
 
-  private publicMessage(message: HistoryMessage, hostId: string, threadId: string, cwd?: string): ConversationMessage {
+  private async publicMessage(message: HistoryMessage, hostId: string, threadId: string, cwd?: string): Promise<ConversationMessage> {
     const { imageInputs, legacyDrawingId, ...safe } = message;
     if (message.role === 'assistant') safe.text = stripResultImageSources(message.text);
     const job = message.clientMessageId ? this.jobs.get(message.clientMessageId) : undefined;
     if (job && job.hostId === hostId && job.threadId === threadId) return { ...safe, ...this.message(job), id: message.id };
     if (message.role === 'assistant' && imageInputs.length) {
-      const result = this.resultImages.attachments({ hostId, threadId, messageId: message.id, cwd, inputs: imageInputs as ResultImageInput[] },
+      const result = await this.resultImages.attachments({ hostId, threadId, messageId: message.id, cwd, inputs: imageInputs as ResultImageInput[] },
         (name, mimeType, bytes) => this.attachment(this.persistAsset(hostId, threadId, name, mimeType, bytes)));
       return { ...safe, text: stripResultImageSources(message.text), attachments: result.attachments,
         ...(result.omittedAttachmentCount > 0 ? { omittedAttachmentCount: result.omittedAttachmentCount } : {}) };
@@ -454,7 +454,10 @@ export class CodexConversations {
     const end = before ? messages.findIndex(message => message.id === before!.id) : messages.length;
     if (end < 0) throw new ConversationError('This history page changed. Refresh the conversation.', 409, 'stale_cursor');
     const start = Math.max(0, end - limit);
-    const page = messages.slice(start, end).map(message => 'imageInputs' in message ? this.publicMessage(message, hostId, threadId, cwd) : message);
+    const page: ConversationMessage[] = [];
+    for (const message of messages.slice(start, end)) {
+      page.push('imageInputs' in message ? await this.publicMessage(message, hostId, threadId, cwd) : message);
+    }
     const receipts = jobs.filter((job, index) => unfinished(job) || index >= jobs.length - 50).map(job => this.receipt(job));
     const first = this.options.verifiedFirstMessage?.(hostId, threadId);
     if (first?.selection && !receipts.some(receipt => receipt.id === first.id)) {
@@ -465,7 +468,7 @@ export class CodexConversations {
         // Creation can be confirmed before its response finishes. Derive this
         // receipt on every history read so a later native reroute stays visible.
         receipts.push({ id: first.id, hostId, threadId, createdAt: first.createdAt, updatedAt: new Date().toISOString(),
-          turnId: turn.id, state: message.state, message: this.publicMessage(message, hostId, threadId, cwd),
+          turnId: turn.id, state: message.state, message: await this.publicMessage(message, hostId, threadId, cwd),
           selection: { ...first.selection }, modelVerification: modelVerificationFor(first.selection, evidence, true),
           ...(evidence ? { modelEvidence: evidence } : {}) });
       }

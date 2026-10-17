@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { fork } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { constants, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 import { homedir } from 'node:os';
@@ -30,6 +32,7 @@ type PersistedAsset = Pick<ResultAttachment, 'id' | 'name' | 'mimeType' | 'avail
 type PersistAsset = (name: string, mimeType: 'image/png' | 'image/jpeg', bytes: Buffer) => PersistedAsset;
 type Request = { hostId: string; threadId: string; messageId: string; cwd?: string; inputs: readonly ResultImageInput[] };
 type SnapshotManifest = { version: 1; hostId: string; threadId: string; messageId: string; inputDigest: string; attachment: ResultAttachment };
+type AttachmentResult = { attachments: ResultAttachment[]; omittedAttachmentCount: number };
 type ImageBytes = { mimeType: 'image/png' | 'image/jpeg'; bytes: Buffer };
 
 const mimeExtensions = new Map<string, 'image/png' | 'image/jpeg'>([['.png', 'image/png'], ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg']]);
@@ -143,14 +146,27 @@ export function resultImageInputs(item: Record<string, unknown>): ResultImageInp
 export class CodexResultImages {
   private readonly manifestDir: string;
   private readonly codexHome: string;
+  private readonly readTimeoutMs: number;
+  private readonly pendingSnapshots = new Map<string, Promise<AttachmentResult>>();
 
-  constructor(options: { dataDir: string; codexHome?: string }) {
+  constructor(options: { dataDir: string; codexHome?: string; readTimeoutMs?: number }) {
+    this.readTimeoutMs = options.readTimeoutMs ?? 2000;
+    if (!Number.isInteger(this.readTimeoutMs) || this.readTimeoutMs < 1 || this.readTimeoutMs > 30_000) throw new Error('Invalid image read deadline');
     this.manifestDir = join(options.dataDir, 'result-images');
     this.codexHome = options.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), '.codex');
     mkdirSync(this.manifestDir, { recursive: true, mode: 0o700 });
   }
 
-  attachments(input: Request, persist: PersistAsset): { attachments: ResultAttachment[]; omittedAttachmentCount: number } {
+  attachments(input: Request, persist: PersistAsset): Promise<AttachmentResult> {
+    const key = JSON.stringify([input.hostId, input.threadId, input.messageId]);
+    const pending = this.pendingSnapshots.get(key);
+    if (pending) return pending;
+    const snapshot = this.snapshot(input, persist).finally(() => this.pendingSnapshots.delete(key));
+    this.pendingSnapshots.set(key, snapshot);
+    return snapshot;
+  }
+
+  private async snapshot(input: Request, persist: PersistAsset): Promise<AttachmentResult> {
     if (!safeHost(input.hostId) || !safeThread(input.threadId) || !input.messageId) {
       return { attachments: [], omittedAttachmentCount: input.inputs.length };
     }
@@ -177,7 +193,7 @@ export class CodexResultImages {
       const name = displayName(candidate.name, `Result image ${index + 1}`);
       let attachment: ResultAttachment;
       try {
-        const image = this.readImage(input, candidate.url);
+        const image = await this.readImage(input, candidate.url);
         if (totalBytes + image.bytes.length > MAX_ATTACHMENT_BYTES) {
           attachment = this.unavailable(input, index, name, 'image/unknown', 'total_size_exceeded');
         } else {
@@ -193,6 +209,12 @@ export class CodexResultImages {
       } catch (error) {
         const reason = this.reason(error);
         attachment = this.unavailable(input, index, name, 'image/unknown', reason);
+        // A timed-out OS read must not be repeated by every history poll. A new
+        // message has a different snapshot key and can retry after permissions change.
+        if (error instanceof ResultImageTimeout) {
+          this.writeManifest(manifestPath, { version: 1, hostId: input.hostId, threadId: input.threadId,
+            messageId: input.messageId, inputDigest, attachment });
+        }
       }
       attachments.push(attachment);
     }
@@ -241,7 +263,7 @@ export class CodexResultImages {
     return code === 'ENOENT' || code === 'ENOTDIR' ? 'image_missing' : 'snapshot_unavailable';
   }
 
-  private readImage(input: Request, url: string): ImageBytes {
+  private async readImage(input: Request, url: string): Promise<ImageBytes> {
     if (url.length > Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 128) throw new ResultImageFailure('image_too_large');
     const data = DATA_URL.exec(url);
     if (data) return { mimeType: data[1] as ImageBytes['mimeType'], bytes: imageBytes(data[2], data[1]) };
@@ -249,59 +271,66 @@ export class CodexResultImages {
     if (/^https?:\/\//i.test(url)) throw new ResultImageFailure('remote_file_unsupported');
     if (input.hostId !== 'local') throw new ResultImageFailure('remote_file_unsupported');
 
-    let candidatePath: string;
-    try {
-      if (url.startsWith('file:')) {
-        const parsed = new URL(url);
-        if (parsed.hostname && parsed.hostname !== 'localhost' || parsed.search || parsed.hash) throw new ResultImageFailure('unsupported_source');
-        candidatePath = decodeURIComponent(parsed.pathname);
-      } else candidatePath = url;
-    } catch (error) {
-      if (error instanceof ResultImageFailure) throw error;
-      throw new ResultImageFailure('unsupported_source');
-    }
-    if (!isAbsolute(candidatePath) || candidatePath.length > 4096) throw new ResultImageFailure('unsupported_source');
-
-    let realCandidate: string;
-    try { realCandidate = realpathSync(candidatePath); }
-    catch (error) {
-      const code = error && typeof error === 'object' ? (error as NodeJS.ErrnoException).code : undefined;
-      if (code === 'ENOENT' || code === 'ENOTDIR') throw new ResultImageFailure('image_missing');
-      throw new ResultImageFailure('snapshot_unavailable');
-    }
-    const roots: string[] = [];
-    if (input.cwd && isAbsolute(input.cwd)) {
-      try { if (statSync(realpathSync(input.cwd)).isDirectory()) roots.push(realpathSync(input.cwd)); } catch { /* An unavailable cwd is not a readable root. */ }
-    }
-    if (safeThread(input.threadId)) {
-      try {
-        const generated = join(this.codexHome, 'generated_images', input.threadId);
-        if (statSync(realpathSync(generated)).isDirectory()) roots.push(realpathSync(generated));
-      } catch { /* No generated image directory is available. */ }
-    }
-    if (!roots.some(root => within(root, realCandidate))) throw new ResultImageFailure('outside_workspace');
-
-    const mimeType = mimeExtensions.get(extname(realCandidate).toLowerCase());
-    if (!mimeType) throw new ResultImageFailure('unsupported_source');
-    const stat = statSync(realCandidate);
-    if (!stat.isFile()) throw new ResultImageFailure('unsupported_source');
-    if (stat.size > MAX_IMAGE_BYTES) throw new ResultImageFailure('image_too_large');
-    const descriptor = openSync(realCandidate, constants.O_RDONLY | constants.O_NOFOLLOW);
-    try {
-      const opened = fstatSync(descriptor);
-      if (!opened.isFile() || opened.size > MAX_IMAGE_BYTES) throw new ResultImageFailure('image_too_large');
-      const buffer = Buffer.alloc(MAX_IMAGE_BYTES + 1);
-      let length = 0;
-      while (length < buffer.length) {
-        const count = readSync(descriptor, buffer, length, buffer.length - length, length);
-        if (count === 0) break;
-        length += count;
-      }
-      if (length > MAX_IMAGE_BYTES) throw new ResultImageFailure('image_too_large');
-      const bytes = imageBytes(buffer.subarray(0, length).toString('base64'), mimeType);
-      return { mimeType, bytes };
-    } finally { closeSync(descriptor); }
+    return readIsolatedImage({ url, cwd: input.cwd, threadId: input.threadId, codexHome: this.codexHome }, this.readTimeoutMs);
   }
+}
+
+type LocalImageRequest = { url: string; cwd?: string; threadId: string; codexHome: string };
+
+function readLocalImage(input: LocalImageRequest): ImageBytes {
+  const url = input.url;
+  let candidatePath: string;
+  try {
+    if (url.startsWith('file:')) {
+      const parsed = new URL(url);
+      if (parsed.hostname && parsed.hostname !== 'localhost' || parsed.search || parsed.hash) throw new ResultImageFailure('unsupported_source');
+      candidatePath = decodeURIComponent(parsed.pathname);
+    } else candidatePath = url;
+  } catch (error) {
+    if (error instanceof ResultImageFailure) throw error;
+    throw new ResultImageFailure('unsupported_source');
+  }
+  if (!isAbsolute(candidatePath) || candidatePath.length > 4096) throw new ResultImageFailure('unsupported_source');
+
+  let realCandidate: string;
+  try { realCandidate = realpathSync(candidatePath); }
+  catch (error) {
+    const code = error && typeof error === 'object' ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new ResultImageFailure('image_missing');
+    throw new ResultImageFailure('snapshot_unavailable');
+  }
+  const roots: string[] = [];
+  if (input.cwd && isAbsolute(input.cwd)) {
+    try { if (statSync(realpathSync(input.cwd)).isDirectory()) roots.push(realpathSync(input.cwd)); } catch { /* An unavailable cwd is not a readable root. */ }
+  }
+  if (safeThread(input.threadId)) {
+    try {
+      const generated = join(input.codexHome, 'generated_images', input.threadId);
+      if (statSync(realpathSync(generated)).isDirectory()) roots.push(realpathSync(generated));
+    } catch { /* No generated image directory is available. */ }
+  }
+  if (!roots.some(root => within(root, realCandidate))) throw new ResultImageFailure('outside_workspace');
+
+  const mimeType = mimeExtensions.get(extname(realCandidate).toLowerCase());
+  if (!mimeType) throw new ResultImageFailure('unsupported_source');
+  const stat = statSync(realCandidate);
+  if (!stat.isFile()) throw new ResultImageFailure('unsupported_source');
+  if (stat.size > MAX_IMAGE_BYTES) throw new ResultImageFailure('image_too_large');
+  const descriptor = openSync(realCandidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || opened.size > MAX_IMAGE_BYTES) throw new ResultImageFailure('image_too_large');
+    const buffer = Buffer.alloc(MAX_IMAGE_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = readSync(descriptor, buffer, length, buffer.length - length, length);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length > MAX_IMAGE_BYTES) throw new ResultImageFailure('image_too_large');
+    const bytes = imageBytes(buffer.subarray(0, length).toString('base64'), mimeType);
+    return { mimeType, bytes };
+  } finally { closeSync(descriptor); }
 }
 
 class ResultImageFailure extends Error {
@@ -313,4 +342,68 @@ function readManifestFile(path: string): string {
   const real = realpathSync(path);
   if (!within(realpathSync(dirname(path)), real)) throw new Error('manifest escaped its directory');
   return readFileSync(real, 'utf8');
+}
+
+
+class ResultImageTimeout extends ResultImageFailure {
+  constructor() { super('snapshot_unavailable'); }
+}
+
+let activeImageReaders = 0;
+const readerArgument = '--petroglyphs-result-image-reader';
+
+function readIsolatedImage(input: LocalImageRequest, timeoutMs: number): Promise<ImageBytes> {
+  // Keep a stuck OS read outside both the HTTP loop and libuv's shared thread
+  // pool. A child still counts against this bound until the OS reports its exit.
+  if (activeImageReaders >= 4) return Promise.reject(new ResultImageFailure('snapshot_unavailable'));
+  return new Promise((resolve, reject) => {
+    const child = fork(new URL(import.meta.url), [readerArgument], {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'], serialization: 'advanced',
+    });
+    activeImageReaders++;
+    let settled = false;
+    const timer = setTimeout(() => finish(new ResultImageTimeout()), timeoutMs);
+    const finish = (error?: Error, image?: ImageBytes) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill('SIGKILL');
+      if (child.connected) child.disconnect();
+      child.unref();
+      if (error) reject(error); else resolve(image!);
+    };
+    child.once('exit', () => {
+      activeImageReaders--;
+      finish(new ResultImageFailure('snapshot_unavailable'));
+    });
+    child.once('error', () => finish(new ResultImageFailure('snapshot_unavailable')));
+    child.once('message', value => {
+      const result = value as { bytes?: unknown; mimeType?: unknown; reason?: unknown } | null;
+      if (result && Buffer.isBuffer(result.bytes) && result.bytes.length <= MAX_IMAGE_BYTES
+        && (result.mimeType === 'image/png' || result.mimeType === 'image/jpeg')) {
+        finish(undefined, { bytes: result.bytes, mimeType: result.mimeType });
+      } else {
+        const reason = result?.reason;
+        finish(new ResultImageFailure(reason === 'image_missing' || reason === 'outside_workspace'
+          || reason === 'unsupported_source' || reason === 'image_too_large' || reason === 'invalid_image'
+          ? reason : 'snapshot_unavailable'));
+      }
+    });
+    child.send(input, error => { if (error) finish(new ResultImageFailure('snapshot_unavailable')); });
+  });
+}
+
+// The same module is the isolated reader entry point in both tsx and dist builds.
+if (process.argv[2] === readerArgument && process.argv[1] === fileURLToPath(import.meta.url) && process.send) {
+  process.once('message', input => {
+    let result: ImageBytes | { reason: ResultImageUnavailableReason };
+    try { result = readLocalImage(input as LocalImageRequest); }
+    catch (error) {
+      const code = error && typeof error === 'object' ? (error as NodeJS.ErrnoException).code : undefined;
+      result = { reason: error instanceof ResultImageFailure ? error.reason
+        : code === 'image_too_large' ? 'image_too_large' : code === 'invalid_image' ? 'invalid_image'
+          : code === 'ENOENT' || code === 'ENOTDIR' ? 'image_missing' : 'snapshot_unavailable' };
+    }
+    process.send!(result, () => { if (process.connected) process.disconnect(); });
+  });
 }

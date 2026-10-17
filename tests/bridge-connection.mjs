@@ -15,7 +15,7 @@ test('publishes current private interfaces and a stable hostname, only verified 
   const bridge = new BridgeConnection(token, async () => snapshot);
   bridge.setPort(3333);
   assert.deepEqual(await bridge.metadata(), {
-    version: 1, id: bridge.id,
+    version: 1, id: bridge.id, name: 'Paired-Mac',
     lanOrigins: ['http://paired-mac.local:3333', 'http://192.168.1.10:3333'],
     tailscaleOrigins: ['http://100.64.0.10:3333'],
   });
@@ -40,7 +40,27 @@ test('identity proofs bind the challenge and owned origin and do not disclose cr
   assert.notEqual(new BridgeConnection('e'.repeat(32)).id, bridge.id, 'new pairing uses a new identity');
 });
 
-test('only identity challenge bypasses required pairing; connection metadata stays private', async () => {
+test('publishes and proves only the owned MagicDNS name with a current Tailscale interface', async () => {
+  let snapshot = { localHostname: 'paired-mac', addresses: ['100.64.0.10'], tailscaleAddresses: ['100.64.0.10'],
+    tailscaleDNSName: 'Paired-Mac.Tail123.TS.NET.' };
+  const bridge = new BridgeConnection(token, async () => snapshot);
+  bridge.setPort(3333);
+  const dnsOrigin = 'http://paired-mac.tail123.ts.net:3333';
+  assert.deepEqual((await bridge.metadata()).tailscaleOrigins, [dnsOrigin, 'http://100.64.0.10:3333']);
+  assert.equal((await bridge.proof(nonce, dnsOrigin)).origin, dnsOrigin);
+  for (const origin of ['http://other-mac.tail123.ts.net:3333', 'http://paired-mac.tail999.ts.net:3333', 'http://paired-mac.tail123.ts.net:4444']) {
+    assert.equal(await bridge.proof(nonce, origin), undefined);
+  }
+  for (const hostname of ['evil.example', 'mac.tail123.ts.net.evil.example', '-mac.tail123.ts.net', 'x'.repeat(64) + '.tail123.ts.net', 'mac.tail123.ts.net..']) {
+    snapshot = { ...snapshot, tailscaleDNSName: hostname };
+    assert.deepEqual((await bridge.metadata()).tailscaleOrigins, ['http://100.64.0.10:3333']);
+  }
+  snapshot = { ...snapshot, tailscaleDNSName: 'paired-mac.tail123.ts.net', addresses: ['192.168.1.10'] };
+  assert.deepEqual((await bridge.metadata()).tailscaleOrigins, []);
+  assert.equal(await bridge.proof(nonce, dnsOrigin), undefined, 'a disconnected Tailscale interface cannot sign a cached DNS candidate');
+});
+
+test('identity challenge works before pairing while authenticated connection metadata stays private', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'petroglyphs-bridge-'));
   const config = join(directory, 'auto.json');
   await writeFile(config, JSON.stringify({ deviceToken: token, codexPath: '/not-used/codex', dataDir: join(directory, 'data') }));

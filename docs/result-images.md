@@ -15,6 +15,17 @@ On the local host, a saved file must resolve inside the conversation's real `cwd
 
 Only PNG and JPEG are accepted. Each image is limited to 10 MiB, each message to four result images and 24 MiB total. Images beyond the four-item cap are counted in `omittedAttachmentCount`. An unavailable image retains a placeholder and one of `remote_file_unsupported`, `outside_workspace`, `unsupported_source`, `invalid_image`, `image_too_large`, `image_missing`, `snapshot_unavailable`, or `total_size_exceeded`.
 
+External file resolution, validation and reading run in an isolated child process.
+The default deadline is two seconds. At most four readers can remain active;
+a terminated reader retains its slot until the OS reports its exit. This keeps
+a blocked OS permission request or file read outside the HTTP event loop and
+libuv's shared thread pool. Inline data images keep their existing validation.
+
+A timed-out result is pinned as `snapshot_unavailable` for that message and source
+slot, so history polling does not repeatedly open the blocked file. A new message
+can read the file after permissions change. Ordinary missing-file failures remain
+retryable. Concurrent polls share the first snapshot for one message.
+
 ## Snapshot pinning and privacy
 
 After a successful read, the paired asset is stored through the conversation asset store and a private manifest is written under `dataDir/result-images/`. Its digest is scoped to host, thread, message, source slot, and display name. Refreshes and restarts reuse the manifest; they do not reread a changed file or changed inline bytes for that same result slot. A different host, thread, message, or source slot gets an independent snapshot.
