@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
+import { performance } from 'node:perf_hooks';
 import { CodexDesktopIpcError, readTurnModelEvidence, type CodexModelSelection, type DesktopTurnModelEvidence, type MessageTurn } from './codex-desktop-ipc.js';
 import { modelSelectionSchema, modelEvidenceSchema, modelVerificationFor, type ModelVerification } from './codex-model-selection.js';
 import { ConversationError, imageBytes, isCodexHost, messageFingerprint, parseMessageInput, type MessageInput } from './codex-message-input.js';
@@ -10,7 +11,8 @@ import { conversationRunState, historyMessages, historyTurns, record, type Conve
 import { CodexRoutingError, isThreadId } from './codex-threads.js';
 
 export interface ConversationConnection {
-  readSnapshot(hostId: string, threadId: string): Promise<{ hostId: string; threadId: string; conversationState: unknown }>;
+  readSnapshot(hostId: string, threadId: string): Promise<{ hostId: string; threadId: string; conversationState: unknown;
+    ownerClientId?: string; revision?: number }>;
   startMessageTurn(input: MessageTurn): Promise<{ turnId: string; clientUserMessageId: string }>;
   close(): void;
 }
@@ -34,7 +36,11 @@ interface Options {
     id: string; turnId: string; sourceMessageId?: string; text: string; createdAt: string; selection?: CodexModelSelection;
   } | undefined;
   retryMs?: number;
+  /** Serialized snapshot budget, shared by at most eight recent targets. Zero disables the projection cache. */
+  historyCacheBytes?: number;
+  onHistoryRead?: (measurement: { cacheHit: boolean; upstreamMs: number; conversionMs: number }) => void;
 }
+interface HistoryProjection { revision: number; owner: string; firstKey: string; bytes: number; turns: HistoryTurn[]; messages: HistoryMessage[] }
 const uuid = z.string().refine(isThreadId);
 const host = z.string().refine(isCodexHost);
 const sha = z.string().regex(/^[a-f0-9]{64}$/);
@@ -67,6 +73,8 @@ export class CodexConversations {
   private readonly jobs = new Map<string, Job>();
   private readonly assets = new Map<string, Asset>();
   private readonly reads = new Map<string, Promise<{ state: unknown; turns: HistoryTurn[]; messages: HistoryMessage[] }>>();
+  private readonly projections = new Map<string, HistoryProjection>();
+  private projectionBytes = 0;
   private readonly jobsDir: string;
   private readonly assetsDir: string;
   private connection?: Promise<ConversationConnection>;
@@ -127,6 +135,7 @@ export class CodexConversations {
 
   private reset(): void {
     const previous = this.connection; this.connection = undefined;
+    this.projections.clear(); this.projectionBytes = 0;
     void previous?.then(connection => connection.close()).catch(() => {});
   }
 
@@ -293,11 +302,24 @@ export class CodexConversations {
     if (current) return current;
     const promise = (async () => {
       await this.options.requireTarget(hostId, threadId);
+      const readStarted = performance.now();
       const snapshot = await (await this.connect()).readSnapshot(hostId, threadId);
+      const upstreamMs = performance.now() - readStarted;
       if (snapshot.hostId !== hostId || snapshot.threadId !== threadId) throw new ConversationError('Codex returned a different chat.', 503, 'invalid_snapshot');
+      const first = this.options.verifiedFirstMessage?.(hostId, threadId);
+      const firstKey = JSON.stringify(first) ?? '';
+      const cached = this.projections.get(key);
+      const canCache = typeof snapshot.ownerClientId === 'string' && snapshot.ownerClientId.length > 0
+        && Number.isSafeInteger(snapshot.revision) && snapshot.revision! >= 0;
+      if (canCache && cached && cached.owner === snapshot.ownerClientId && cached.revision === snapshot.revision && cached.firstKey === firstKey) {
+        this.projections.delete(key); this.projections.set(key, cached);
+        this.reconcile(hostId, threadId, cached.turns, cached.messages);
+        this.options.onHistoryRead?.({ cacheHit: true, upstreamMs, conversionMs: 0 });
+        return { state: snapshot.conversationState, turns: cached.turns, messages: cached.messages };
+      }
+      const conversionStarted = performance.now();
       const turns = historyTurns(snapshot.conversationState, threadId);
       const messages = historyMessages(turns);
-      const first = this.options.verifiedFirstMessage?.(hostId, threadId);
       const firstTurn = first && turns.find(turn => turn.id === first.turnId);
       if (first && firstTurn) {
         // Native creation can save the turn receipt before Desktop publishes
@@ -315,7 +337,22 @@ export class CodexConversations {
               : firstTurn.status === 'completed' ? 'completed' : 'unknown', attachments: [], imageInputs: [] });
         }
       }
+      const conversionMs = performance.now() - conversionStarted;
+      if (cached) { this.projectionBytes -= cached.bytes; this.projections.delete(key); }
+      const budget = this.options.historyCacheBytes ?? 16 * 1024 * 1024;
+      if (canCache && budget > 0) {
+        const bytes = Buffer.byteLength(JSON.stringify(snapshot.conversationState));
+        if (bytes <= budget) {
+          while (this.projections.size > 0 && (this.projections.size >= 8 || this.projectionBytes + bytes > budget)) {
+            const oldest = this.projections.keys().next().value!;
+            this.projectionBytes -= this.projections.get(oldest)!.bytes; this.projections.delete(oldest);
+          }
+          this.projections.set(key, { owner: snapshot.ownerClientId!, revision: snapshot.revision!, firstKey, bytes, turns, messages });
+          this.projectionBytes += bytes;
+        }
+      }
       this.reconcile(hostId, threadId, turns, messages);
+      this.options.onHistoryRead?.({ cacheHit: false, upstreamMs, conversionMs });
       return { state: snapshot.conversationState, turns, messages };
     })().catch(error => { this.reset(); throw error; }).finally(() => this.reads.delete(key));
     this.reads.set(key, promise);

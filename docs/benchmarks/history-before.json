@@ -1,0 +1,26 @@
+{
+  "node": "v26.10.0",
+  "turns": 2000,
+  "iterations": 15,
+  "snapshotBytes": 5050598,
+  "responseBytes": 47865,
+  "cacheEnabled": false,
+  "unchanged": {
+    "upstreamReads": 15,
+    "meanReadAndParseMs": 13.01,
+    "projectionCacheHits": 0,
+    "measuredConversionMeanMs": 19.885,
+    "uncachedConversionMedianMs": 13.583,
+    "responseSerializationMedianMs": 0.029,
+    "loopbackTransferMedianMs": 0.859,
+    "totalMedianMs": 24.18
+  },
+  "changedSnapshotMs": 20.673,
+  "restartSnapshotMs": 19.373,
+  "correctness": {
+    "unchanged": true,
+    "appendedTurn": true,
+    "restartAndOwnerChange": true
+  },
+  "boundary": "Synthetic full-snapshot parse, conversion, JSON serialization and loopback HTTP transfer. LAN, Tailscale and iPad rendering are not measured."
+}

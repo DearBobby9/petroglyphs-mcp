@@ -459,6 +459,32 @@ test('history is chronological and bounded, hides internal events, serves only s
   await assert.rejects(f.service.conversation(host, thread, { limit: 101 }), error => error.status === 400);
 });
 
+test('history projection reuse follows owner and revision and resynchronizes after a failed read', async t => {
+  const metrics = [];
+  let ownerClientId = 'owner-a', revision = 1, offline = false;
+  let turns = [nativeTurn(randomUUID(), 'First')];
+  const f = await fixture(t, { onHistoryRead: metric => metrics.push(metric), connect: async () => ({ close() {},
+    async startMessageTurn() { assert.fail('History reads must not send'); },
+    async readSnapshot(hostId, threadId) {
+      if (offline) throw new Error('Disconnected');
+      return { hostId, threadId, ownerClientId, revision, conversationState: state(hostId, threadId, turns) };
+    } }) });
+  const initial = await f.service.conversation(host, thread);
+  assert.deepEqual((await f.service.conversation(host, thread)).messages, initial.messages);
+  assert.equal(metrics.at(-1).cacheHit, true);
+  turns = [...turns, nativeTurn(randomUUID(), 'Added')]; revision++;
+  assert.equal((await f.service.conversation(host, thread)).messages.at(-1).text, 'Answer Added');
+  assert.equal(metrics.at(-1).cacheHit, false);
+  ownerClientId = 'owner-b'; // A replacement owner may reuse the same revision.
+  turns = [nativeTurn(randomUUID(), 'Replacement owner')];
+  assert.equal((await f.service.conversation(host, thread)).messages.at(-1).text, 'Answer Replacement owner');
+  offline = true;
+  await assert.rejects(f.service.conversation(host, thread), /Disconnected/);
+  offline = false; turns = [nativeTurn(randomUUID(), 'Reconnected')];
+  assert.equal((await f.service.conversation(host, thread)).messages.at(-1).text, 'Answer Reconnected');
+  assert.equal(metrics.at(-1).cacheHit, false);
+});
+
 test('validation rejects empty, oversized and forged attachment inputs before native dispatch', () => {
   for (const invalid of [input(' '), input('a'.repeat(20001)), input('Hi', { attachments: Array.from({ length: 5 }, () => image()) }),
     input('Hi', { attachments: [image({ dataBase64: 'notbase64' })] }), input('Hi', { attachments: [image({ mimeType: 'image/jpeg' })] }),
