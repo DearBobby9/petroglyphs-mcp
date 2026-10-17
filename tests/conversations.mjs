@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
@@ -305,6 +305,77 @@ test('a crash after the durable dispatch boundary recovers as unknown and never 
   f.turns.set(`${host}:${thread}`, [nativeTurn(message.id, message.text)]);
   assert.equal((await restored.get(host, thread, message.id)).state, 'completed');
   assert.equal(f.attempts.length, attemptsBeforeRestart);
+});
+
+test('releasing an uncertain delivery survives restart, unblocks once and associates a late result with the original request', async t => {
+  const f = await fixture(t);
+  const first = input('Uncertain'), second = input('Continue after uncertainty');
+  await f.service.accept(first);
+  f.service.close();
+  const path = join(f.dir, 'messages', `${first.id}.json`);
+  const saved = JSON.parse(await readFile(path, 'utf8'));
+  saved.state = 'dispatching';
+  await writeFile(path, JSON.stringify(saved));
+  const recovered = f.open();
+  await recovered.accept(second);
+  await recovered.drain();
+  assert.equal(f.attempts.length, 0);
+  const released = recovered.releaseWait(host, thread, first.id);
+  assert.equal(released.state, 'unknown');
+  assert.equal(released.queueBlocking, false);
+  assert(released.waitReleasedAt);
+  assert.equal(recovered.releaseWait(host, thread, first.id).waitReleasedAt, released.waitReleasedAt);
+  recovered.close();
+  const restarted = f.open();
+  await restarted.drain();
+  assert.deepEqual(f.attempts.map(attempt => attempt.clientUserMessageId), [second.id]);
+  f.turns.get(`${host}:${thread}`).unshift(nativeTurn(first.id, first.text));
+  const late = await restarted.get(host, thread, first.id);
+  assert.equal(late.state, 'completed');
+  assert.equal(late.message.clientMessageId, first.id);
+  assert.equal(late.waitReleasedAt, released.waitReleasedAt);
+  restarted.releaseWait(host, thread, first.id);
+  await restarted.drain();
+  assert.deepEqual(f.attempts.map(attempt => attempt.clientUserMessageId), [second.id]);
+});
+
+test('pending cancellation wins a paused preflight and cannot cancel a dispatched request', async t => {
+  let unblock, entered;
+  const paused = new Promise(resolve => { unblock = resolve; });
+  const checking = new Promise(resolve => { entered = resolve; });
+  let checks = 0;
+  const f = await fixture(t, { requireTarget: async () => {
+    if (++checks === 2) { entered(); await paused; }
+  } });
+  const first = input('Cancel before transport');
+  await f.service.accept(first);
+  const draining = f.service.drain();
+  await checking;
+  assert.equal(f.service.cancel(host, thread, first.id).state, 'cancelled');
+  unblock(); await draining;
+  assert.equal(f.attempts.length, 0);
+  const restored = f.restart();
+  assert.equal((await restored.get(host, thread, first.id)).state, 'cancelled');
+  const second = input('Already dispatched');
+  await restored.accept(second);
+  await f.waitForAttempts(1);
+  assert.throws(() => restored.cancel(host, thread, second.id), error => error.code === 'cannot_cancel');
+  assert.throws(() => restored.releaseWait('local', thread, second.id), error => error.status === 404);
+});
+
+test('a failed queue-release save cannot let a later message pass the unresolved request', async t => {
+  const f = await fixture(t);
+  const first = input('Uncertain delivery');
+  f.mode = 'unknown';
+  await f.service.accept(first); await f.waitForAttempts(1);
+  const next = input('Still waiting'); await f.service.accept(next); await f.service.drain();
+  const blockedWrite = join(f.dir, 'messages', `${first.id}.json.tmp`);
+  await mkdir(blockedWrite);
+  assert.throws(() => f.service.releaseWait(host, thread, first.id));
+  await rm(blockedWrite, { recursive: true });
+  f.mode = 'normal'; await f.service.drain();
+  assert.equal((await f.service.get(host, thread, first.id)).queueBlocking, true);
+  assert.deepEqual(f.attempts.map(attempt => attempt.clientUserMessageId), [first.id]);
 });
 
 test('legacy drawing prompts become image messages without removing ordinary user text', async t => {

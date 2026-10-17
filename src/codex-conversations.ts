@@ -18,6 +18,7 @@ export interface MessageReceipt {
   id: string; hostId: string; threadId: string; createdAt: string; updatedAt: string;
   state: ConversationMessage['state']; turnId?: string; message: ConversationMessage; error?: string; notice?: string;
   selection?: CodexModelSelection; modelEvidence?: DesktopTurnModelEvidence; modelVerification?: ModelVerification;
+  queueBlocking?: boolean; waitReleasedAt?: string;
 }
 export interface ConversationPage {
   hostId: string; threadId: string; messages: ConversationMessage[]; beforeCursor: string | null;
@@ -41,7 +42,8 @@ const savedAttachmentSchema = z.object({ id: uuid, name: z.string().min(1).max(2
 const jobSchema = z.object({
   version: z.literal(1), id: uuid, hostId: host, threadId: uuid, fingerprint: sha, text: z.string().max(20_000),
   attachments: z.array(savedAttachmentSchema).max(4), createdAt: z.string().datetime(), updatedAt: z.string().datetime(),
-  state: z.enum(['pending', 'dispatching', 'queued', 'running', 'completed', 'failed', 'unknown']),
+  state: z.enum(['pending', 'dispatching', 'queued', 'running', 'completed', 'failed', 'unknown', 'cancelled']),
+  waitReleasedAt: z.string().datetime().optional(),
   turnId: z.string().optional(), observedMessageId: z.string().optional(), turnFinished: z.boolean().optional(),
   error: z.string().optional(), notice: z.string().optional(),
   selection: modelSelectionSchema.optional(), modelEvidence: modelEvidenceSchema.optional(),
@@ -52,7 +54,8 @@ const assetSchema = z.object({ id: sha, hostId: host, threadId: uuid, name: z.st
 type Asset = z.infer<typeof assetSchema>;
 const cursorSchema = z.object({ v: z.literal(1), hostId: host, threadId: uuid, id: z.string().min(1).max(256) }).strict();
 const targetKey = (hostId: string, threadId: string) => `${hostId}\0${threadId}`;
-const unfinished = (job: Job) => !job.turnFinished && !['completed', 'failed'].includes(job.state);
+const unfinished = (job: Job) => !job.turnFinished && !['completed', 'failed', 'cancelled'].includes(job.state);
+const blocksQueue = (job: Job) => unfinished(job) && !job.waitReleasedAt;
 
 export function validateConversationTarget(hostId: unknown, threadId: unknown): asserts hostId is string {
   if (!isCodexHost(hostId) || !isThreadId(threadId)) throw new ConversationError('Select a valid Codex connection and chat.', 400, 'invalid_target');
@@ -143,6 +146,7 @@ export class CodexConversations {
   private receipt(job: Job): MessageReceipt {
     return { id: job.id, hostId: job.hostId, threadId: job.threadId, createdAt: job.createdAt, updatedAt: job.updatedAt,
       state: job.state, ...(job.turnId ? { turnId: job.turnId } : {}), message: this.message(job),
+      queueBlocking: blocksQueue(job), ...(job.waitReleasedAt ? { waitReleasedAt: job.waitReleasedAt } : {}),
       ...(job.selection ? { selection: { ...job.selection },
         modelVerification: modelVerificationFor(job.selection, job.modelEvidence, Boolean(job.turnId)) } : {}),
       ...(job.modelEvidence ? { modelEvidence: structuredClone(job.modelEvidence) } : {}),
@@ -165,7 +169,7 @@ export class CodexConversations {
     // persisted this UUID while it was in flight.
     const second = existing();
     if (second) return { receipt: this.receipt(second), duplicate: true };
-    const pending = [...this.jobs.values()].filter(unfinished);
+    const pending = [...this.jobs.values()].filter(blocksQueue);
     if (pending.length >= 1000 || pending.filter(job => job.hostId === input.hostId && job.threadId === input.threadId).length >= 100) {
       throw new ConversationError('Too many messages are waiting. Let the existing messages finish before sending more.', 429, 'queue_full');
     }
@@ -189,15 +193,44 @@ export class CodexConversations {
   }
 
   async get(hostId: string, threadId: string, id: string): Promise<MessageReceipt> {
+    const job = this.requireJob(hostId, threadId, id);
+    if (['queued', 'running', 'unknown'].includes(job.state)) {
+      // Durable admission remains readable while Desktop is temporarily offline.
+      try { await this.read(hostId, threadId); }
+      catch { job.notice = 'Codex is temporarily unavailable. The original delivery is still being checked.'; this.save(job); }
+    }
+    return this.receipt(job);
+  }
+
+  private requireJob(hostId: string, threadId: string, id: string): Job {
     validateConversationTarget(hostId, threadId);
     const job = this.jobs.get(id);
     if (!isThreadId(id) || !job || job.hostId !== hostId || job.threadId !== threadId) {
       throw new ConversationError('This message was not accepted for the selected chat.', 404, 'message_not_found');
     }
-    if (['queued', 'running', 'unknown'].includes(job.state)) {
-      // Durable admission remains readable while Desktop is temporarily offline.
-      try { await this.read(hostId, threadId); }
-      catch { job.notice = 'Codex is temporarily unavailable. The original delivery is still being checked.'; this.save(job); }
+    return job;
+  }
+
+  releaseWait(hostId: string, threadId: string, id: string): MessageReceipt {
+    const job = this.requireJob(hostId, threadId, id);
+    if (!job.waitReleasedAt) {
+      if (job.state !== 'unknown') throw new ConversationError('Only an uncertain delivery can release its queue wait.', 409, 'cannot_release_wait');
+      const released = { ...job, waitReleasedAt: new Date().toISOString() };
+      this.save(released);
+      Object.assign(job, released);
+      setImmediate(() => { void this.drain(); });
+    }
+    return this.receipt(job);
+  }
+
+  cancel(hostId: string, threadId: string, id: string): MessageReceipt {
+    const job = this.requireJob(hostId, threadId, id);
+    if (job.state !== 'cancelled') {
+      if (job.state !== 'pending') throw new ConversationError('This message crossed the delivery boundary and cannot be cancelled locally.', 409, 'cannot_cancel');
+      const cancelled: Job = { ...job, state: 'cancelled' }; delete cancelled.notice;
+      this.save(cancelled);
+      Object.assign(job, cancelled); delete job.notice;
+      setImmediate(() => { void this.drain(); });
     }
     return this.receipt(job);
   }
@@ -254,7 +287,7 @@ export class CodexConversations {
       if (job.hostId !== hostId || job.threadId !== threadId) continue;
       const message = messages.find(message => message.role === 'user' && message.clientMessageId === job.id);
       const turn = turns.find(turn => turn.id === (message?.turnId ?? job.turnId));
-      if (!turn || job.state === 'pending') continue;
+      if (!turn || ['pending', 'cancelled'].includes(job.state)) continue;
       const before = JSON.stringify(job);
       job.turnId = turn.id;
       job.modelEvidence = readTurnModelEvidence(turn);
@@ -367,7 +400,7 @@ export class CodexConversations {
     // same snapshot for every queued message, while other targets can proceed.
     const targets = new Map<string, Job[]>();
     for (const job of this.jobs.values()) {
-      if (!unfinished(job)) continue;
+      if (!blocksQueue(job)) continue;
       const key = targetKey(job.hostId, job.threadId);
       targets.set(key, [...targets.get(key) ?? [], job]);
     }
@@ -376,7 +409,7 @@ export class CodexConversations {
       let first = jobs[0];
       if (first.state !== 'pending') {
         try { await this.read(first.hostId, first.threadId); } catch { continue; }
-        const next = jobs.find(unfinished);
+        const next = jobs.find(blocksQueue);
         if (!next || next.state !== 'pending') continue;
         first = next;
       }
@@ -385,21 +418,25 @@ export class CodexConversations {
         await this.options.requireTarget(first.hostId, first.threadId);
         connection = await this.connect();
       } catch (error) {
+        if (first.state !== 'pending') continue;
         if (error instanceof CodexRoutingError && [400, 404].includes(error.status)) {
           first.state = 'failed'; first.error = 'The selected chat is no longer available. Refresh the chat selector.';
         } else first.notice = 'Waiting for the selected Codex connection.';
         this.save(first); continue;
       }
       if (this.closed) return;
+      if (first.state !== 'pending') continue;
       try {
         await this.requireSelection(first.hostId, first.selection, first.attachments.length > 0);
       } catch (error) {
+        if (first.state !== 'pending') continue;
         if (error instanceof CodexRoutingError && [400, 404, 422].includes(error.status)) {
           first.state = 'failed'; first.error = 'The selected model or reasoning effort is no longer available. Choose a valid pair for a new message.';
         } else first.notice = 'Waiting to confirm the selected model on this connection.';
         this.save(first); continue;
       }
       if (this.closed) return;
+      if (first.state !== 'pending') continue;
       let attachments: MessageTurn['attachments'];
       try {
         attachments = first.attachments.map(attachment => ({ mimeType: attachment.mimeType,

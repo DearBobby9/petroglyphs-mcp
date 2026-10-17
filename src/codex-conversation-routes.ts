@@ -61,6 +61,17 @@ export function installConversationRoutes(app: Express, service?: CodexConversat
     } catch (error) { failure(res, error); }
   });
 
+  for (const action of ['release-wait', 'cancel'] as const) {
+    app.post(`/api/codex/messages/:id/${action}`, (req, res) => {
+      if (!authorize(res)) return;
+      try {
+        const { hostId, threadId } = target(req);
+        res.json(action === 'release-wait' ? service!.releaseWait(hostId, threadId, String(req.params.id))
+          : service!.cancel(hostId, threadId, String(req.params.id)));
+      } catch (error) { failure(res, error); }
+    });
+  }
+
   app.get('/api/codex/assets/:id', (req, res) => {
     if (!authorize(res)) return;
     try {

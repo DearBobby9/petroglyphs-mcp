@@ -19,7 +19,7 @@ export interface ConversationMessage {
   text: string;
   phase: 'user' | 'commentary' | 'final_answer' | 'unknown';
   createdAt: string | null;
-  state: SubmissionState;
+  state: SubmissionState | 'cancelled';
   attachments: ConversationAttachment[];
 }
 export interface HistoryMessage extends ConversationMessage {
