@@ -177,6 +177,28 @@ test('a late native first message uses its real identity when the creation recei
   assert.equal(f.attempts.length, 0);
 });
 
+test('an uncertain created first message joins the durable queue without dispatching again', async t => {
+  const f = await fixture(t);
+  const first = input('First image', { attachments: [image()] });
+  f.service.adoptFirstMessage(first, { state: 'unknown', createdAt: new Date().toISOString() });
+  assert.equal((await f.service.get(host, thread, first.id)).state, 'unknown');
+  assert.equal((await f.service.accept(first)).duplicate, true);
+  const next = input('Later message');
+  await f.service.accept(next); await f.service.drain();
+  assert.equal(f.attempts.length, 0);
+  f.service.releaseWait(host, thread, first.id);
+  const restored = f.restart();
+  await restored.drain();
+  assert.deepEqual(f.attempts.map(attempt => attempt.clientUserMessageId), [next.id]);
+  const firstTurn = nativeTurn(first.id, first.text);
+  f.turns.get(`${host}:${thread}`).unshift(firstTurn);
+  const receipt = await restored.get(host, thread, first.id);
+  assert.equal(receipt.state, 'completed');
+  assert.equal(receipt.message.attachments.length, 1);
+  restored.adoptFirstMessage(first, { state: 'unknown', createdAt: receipt.createdAt });
+  assert.equal((await restored.get(host, thread, first.id)).state, 'completed');
+});
+
 async function fixture(t, overrides = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'petroglyphs-conversation-'));
   const turns = new Map();

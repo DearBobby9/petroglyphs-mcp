@@ -36,7 +36,8 @@ type NativeReceipt = z.infer<typeof receiptSchema>;
 
 function fingerprint(input: ProjectChatExecution): string {
   return createHash('sha256').update(JSON.stringify({ id: input.id, hostId: input.hostId, projectId: input.projectId,
-    prompt: input.prompt, title: input.title, selection: input.selection, createdAt: input.createdAt })).digest('hex');
+    prompt: input.prompt, title: input.title, selection: input.selection, createdAt: input.createdAt,
+    ...(input.attachments?.length ? { attachments: input.attachments } : {}) })).digest('hex');
 }
 const sameRoots = (left: string[], right: string[]) => left.length === right.length && left.every((root, index) => root === right[index]);
 
@@ -226,7 +227,8 @@ export class CodexNativeCreator implements ProjectChatExecutor {
       let result;
       try {
         result = await desktop.startMessageTurn({ hostId: 'local', threadId: receipt.thread.id,
-          clientUserMessageId: input.id, text: input.prompt, attachments: [],
+          clientUserMessageId: input.id, text: input.prompt,
+          attachments: (input.attachments ?? []).map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
           ...(input.selection ? { selection: { ...input.selection } } : { initialModelSettings: receipt.effectiveSettings! }) });
       } catch (error) {
         if (error instanceof CodexDesktopIpcError && error.outcome === 'not_sent') {
@@ -274,7 +276,9 @@ export class CodexNativeCreator implements ProjectChatExecutor {
     if (!receipt.projectVerified) return this.observation(receipt);
     const turns = historyTurns(snapshot.conversationState, receipt.thread!.id);
     const messages = historyMessages(turns).filter(message => message.role === 'user' && message.clientMessageId === input.id);
-    if (messages.length === 1 && messages[0].text === input.prompt && messages[0].imageInputs.length === 0) {
+    const expectedImages = (input.attachments ?? []).map(image => `data:${image.mimeType};base64,${image.dataBase64}`);
+    if (messages.length === 1 && messages[0].text === input.prompt && messages[0].imageInputs.length === expectedImages.length
+      && messages[0].imageInputs.every((image, index) => record(image)?.url === expectedImages[index])) {
       const turn = turns.find(turn => turn.id === messages[0].turnId);
       if (turn && isThreadId(turn.id) && (!receipt.firstTurnId || turn.id === receipt.firstTurnId)) {
         receipt.stage = 'completed'; receipt.firstTurnId = turn.id; receipt.firstMessageId = messages[0].id;

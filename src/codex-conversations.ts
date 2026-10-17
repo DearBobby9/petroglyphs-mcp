@@ -4,7 +4,7 @@ import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { CodexDesktopIpcError, readTurnModelEvidence, type CodexModelSelection, type DesktopTurnModelEvidence, type MessageTurn } from './codex-desktop-ipc.js';
 import { modelSelectionSchema, modelEvidenceSchema, modelVerificationFor, type ModelVerification } from './codex-model-selection.js';
-import { ConversationError, imageBytes, isCodexHost, messageFingerprint, parseMessageInput } from './codex-message-input.js';
+import { ConversationError, imageBytes, isCodexHost, messageFingerprint, parseMessageInput, type MessageInput } from './codex-message-input.js';
 import { conversationRunState, historyMessages, historyTurns, record, type ConversationAttachment,
   type ConversationMessage, type HistoryMessage, type HistoryTurn } from './codex-conversation-history.js';
 import { CodexRoutingError, isThreadId } from './codex-threads.js';
@@ -204,6 +204,32 @@ export class CodexConversations {
     if (!selection) return;
     if (!this.options.requireSelection) throw new ConversationError('The model catalogue is unavailable for this connection.', 503, 'catalogue_unavailable');
     await this.options.requireSelection(hostId, { ...selection }, hasImages);
+  }
+
+  /** Creation already crossed its own durable send boundary. Adoption never dispatches. */
+  adoptFirstMessage(value: MessageInput, evidence: { state: 'unknown' | 'queued'; createdAt: string; turnId?: string; sourceMessageId?: string }): void {
+    const input = parseMessageInput(value), fingerprint = messageFingerprint(input);
+    const existing = this.jobs.get(input.id);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) throw new ConversationError('The first message identity conflicts with an existing request.', 409, 'id_conflict');
+      if (evidence.turnId && !existing.turnId) {
+        existing.turnId = evidence.turnId;
+        if (existing.state === 'unknown' && !existing.turnFinished) existing.state = 'queued';
+        if (evidence.sourceMessageId) existing.observedMessageId = evidence.sourceMessageId;
+        this.save(existing);
+      }
+      return;
+    }
+    if (!Number.isSafeInteger(this.nextSequence)) throw new Error('Conversation admission sequence is exhausted');
+    const job: Job = { version: 1, id: input.id, hostId: input.hostId, threadId: input.threadId, text: input.text,
+      fingerprint, enqueueSequence: this.nextSequence++, createdAt: evidence.createdAt, updatedAt: new Date().toISOString(),
+      state: evidence.state, ...(evidence.turnId ? { turnId: evidence.turnId } : {}),
+      ...(evidence.sourceMessageId ? { observedMessageId: evidence.sourceMessageId } : {}),
+      ...(input.selection ? { selection: { ...input.selection } } : {}),
+      attachments: input.attachments.map(attachment => ({ id: attachment.id, name: attachment.name, mimeType: attachment.mimeType,
+        assetId: this.persistAsset(input.hostId, input.threadId, attachment.name, attachment.mimeType,
+          imageBytes(attachment.dataBase64, attachment.mimeType)).id })) };
+    this.save(job); this.jobs.set(job.id, job);
   }
 
   async get(hostId: string, threadId: string, id: string): Promise<MessageReceipt> {

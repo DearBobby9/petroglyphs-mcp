@@ -19,12 +19,13 @@ export interface MessageInput {
   selection?: CodexModelSelection;
 }
 const uuid = z.string().refine(isThreadId);
+export const messageAttachmentSchema = z.object({ id: uuid, name: z.string().trim().min(1).max(200)
+  .refine(name => !/[\x00-\x1f\x7f/\\]/.test(name)),
+  mimeType: z.enum(['image/png', 'image/jpeg']), dataBase64: z.string().max(Math.ceil(MAX_IMAGE_BYTES / 3) * 4),
+}).strict();
 const inputSchema = z.object({
   id: uuid, hostId: z.string().refine(isCodexHost), threadId: uuid, text: z.string().max(20_000),
-  attachments: z.array(z.object({ id: uuid, name: z.string().trim().min(1).max(200)
-    .refine(name => !/[\x00-\x1f\x7f/\\]/.test(name)),
-  mimeType: z.enum(['image/png', 'image/jpeg']), dataBase64: z.string().max(Math.ceil(MAX_IMAGE_BYTES / 3) * 4),
-  }).strict()).max(4),
+  attachments: z.array(messageAttachmentSchema).max(4),
   selection: modelSelectionSchema.optional(),
 }).strict();
 

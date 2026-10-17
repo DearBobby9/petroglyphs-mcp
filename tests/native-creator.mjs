@@ -24,7 +24,8 @@ async function fixture(t, selection = { model: 'selected-model', reasoningEffort
   const receipt = () => JSON.parse(readFileSync(receiptPath, 'utf8'));
   const publish = () => { turns = [{ turnId, status: 'completed', params: { clientUserMessageId: input.id,
     collaborationMode: { mode: 'default', settings: { model: controls.nativeModel, reasoning_effort: controls.nativeEffort, developer_instructions: null } } },
-    items: [{ id: randomUUID(), type: 'userMessage', clientId: input.id, content: [{ type: 'text', text: input.prompt }] },
+    items: [{ id: randomUUID(), type: 'userMessage', clientId: input.id, content: [{ type: 'text', text: input.prompt },
+      ...(input.attachments ?? []).map(image => ({ type: 'image', url: `data:${image.mimeType};base64,${image.dataBase64}` }))] },
       { id: randomUUID(), type: 'agentMessage', phase: 'final_answer', text: 'Done' }] }]; };
   const options = { dataDir: root, codexPath: '/fixture/codex', adoptionMs: 0,
     catalog: { nativeLocalIdentity: async () => identity },
@@ -81,6 +82,23 @@ test('native creation saves the real ID, closes stdio, opens once, then sends th
   await Promise.all([f.creator.createChat(f.input), f.creator.recoverChat(f.input)]);
   assert.equal(f.requests.filter(request => request.method === 'thread/start').length, 1); assert.equal(f.sends.length, 1);
   assert.equal(f.events.filter(event => event === 'open').length, 1);
+});
+
+test('native first images stay fixed across an uncertain acknowledgement and recover without another send', async t => {
+  const f = await fixture(t);
+  f.input.attachments = [{ id: randomUUID(), name: 'First.png', mimeType: 'image/png',
+    dataBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=' }];
+  f.controls.publishOnSend = false;
+  f.controls.sendError = new CodexDesktopIpcError('Lost acknowledgement', 503, 'unknown');
+  assert.equal((await f.creator.createChat(f.input)).firstMessageState, 'unknown');
+  assert.deepEqual(f.sends[0].attachments, f.input.attachments.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })));
+  f.creator.close();
+  const restored = f.open();
+  await assert.rejects(restored.recoverChat({ ...f.input, attachments: [] }), /identity mismatch/);
+  f.publish();
+  assert.equal((await restored.recoverChat(f.input)).state, 'completed');
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.requests.filter(request => request.method === 'thread/start').length, 1);
 });
 
 test('unset native effort stays null and native defaults survive Desktop changing its loaded defaults', async t => {

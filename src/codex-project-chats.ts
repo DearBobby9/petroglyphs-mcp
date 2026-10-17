@@ -4,7 +4,7 @@ import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { ProjectCreationNotSentError } from './codex-companion-creator.js';
 import type { CodexModelSelection, DesktopTurnModelEvidence } from './codex-desktop-ipc.js';
-import { ConversationError, isCodexHost } from './codex-message-input.js';
+import { ConversationError, isCodexHost, messageAttachmentSchema, parseMessageInput, type MessageAttachmentInput, type MessageInput } from './codex-message-input.js';
 import { modelEvidenceSchema, modelSelectionSchema, modelVerificationFor, type ModelVerification } from './codex-model-selection.js';
 import { CodexProjectsCatalog, validProjectId } from './codex-projects-catalog.js';
 import { isThreadId, type CodexThread, type ThreadQuery } from './codex-threads.js';
@@ -16,6 +16,7 @@ export interface ProjectChatReceipt {
   selection?: CodexModelSelection; modelEvidence?: DesktopTurnModelEvidence; modelVerification?: ModelVerification;
   attemptId: string; attemptNumber: 1 | 2; canRetry: boolean; failureCode?: 'approval_review_timeout';
   creationMethod?: 'native' | 'companion'; firstMessageState?: 'not_sent' | 'unknown' | 'sent';
+  firstMessageRequestId?: string; firstTurnId?: string; firstMessageId?: string;
 }
 export interface ProjectChatRetryProof {
   requestId: string; attemptId: string; hostId: string; projectId: string; executorThreadId: string;
@@ -27,6 +28,7 @@ export interface ProjectChatRetry {
 export interface ProjectChatExecution {
   id: string; hostId: string; projectId: string; prompt: string; title?: string; createdAt: string; executorThreadId?: string; requestPath: string;
   selection?: CodexModelSelection;
+  attachments?: MessageAttachmentInput[];
   retry?: ProjectChatRetry;
 }
 export type ProjectChatObservation = { state: 'creating' | 'unknown' }
@@ -48,11 +50,13 @@ interface Options {
   executor: ProjectChatExecutor;
   localExecutor?: ProjectChatExecutor;
   requireSelection?: (hostId: string, selection: CodexModelSelection, hasImages: boolean) => Promise<unknown>;
+  onFirstMessage?: (input: MessageInput, evidence: { state: 'unknown' | 'queued'; createdAt: string; turnId?: string; sourceMessageId?: string }) => void;
   unknownAfterMs?: number;
   retryMs?: number;
 }
 const createSchema = z.object({ id: z.string().refine(isThreadId), hostId: z.string().refine(isCodexHost),
-  projectId: z.string().refine(validProjectId), prompt: z.string().max(20_000).refine(value => value.trim().length > 0),
+  projectId: z.string().refine(validProjectId), prompt: z.string().max(20_000),
+  attachments: z.array(messageAttachmentSchema).max(4).optional(),
   title: z.string().trim().min(1).max(120).optional(),
   selection: modelSelectionSchema.optional(),
 }).strict();
@@ -86,6 +90,15 @@ const jobSchema = createSchema.extend({ version: z.union([z.literal(1), z.litera
       && job.attempts[1].previousFailure?.hostId === job.hostId && job.attempts[1].previousFailure?.projectId === job.projectId
       && job.attempts[1].previousFailure?.executorThreadId === job.executorThreadId))), 'Invalid creation attempts');
 type Job = z.infer<typeof jobSchema>;
+
+function creationModelWarning(job: Job): string | undefined {
+  if (!job.selection) return;
+  const verification = modelVerificationFor(job.selection, job.modelEvidence, !!job.firstTurnId);
+  return verification === 'different'
+    ? 'The chat was created, but Codex used different model settings or rerouted its first response. Continue in this chat instead of creating another one.'
+    : verification === 'unverified'
+      ? 'The chat was created, but Codex could not confirm the model settings of its first response. Continue in this chat instead of creating another one.' : undefined;
+}
 
 /** Durable creation admission. A written native call is never replayed. */
 export class CodexProjectChats {
@@ -121,6 +134,19 @@ export class CodexProjectChats {
     job.updatedAt = new Date().toISOString();
     const path = join(this.options.dataDir, `${job.id}.json`);
     writeFileSync(`${path}.tmp`, JSON.stringify(job), { mode: 0o600 }); renameSync(`${path}.tmp`, path);
+    this.publishFirstMessage(job);
+  }
+
+  private publishFirstMessage(job: Job): void {
+    if (!job.thread || !['unknown', 'sent'].includes(job.firstMessageState ?? '')) return;
+    this.options.onFirstMessage?.({ id: job.id, hostId: job.hostId, threadId: job.thread.id,
+      text: job.prompt, attachments: job.attachments ?? [], ...(job.selection ? { selection: job.selection } : {}) },
+    { state: job.firstMessageState === 'sent' ? 'queued' : 'unknown', createdAt: job.createdAt,
+      ...(job.firstTurnId ? { turnId: job.firstTurnId } : {}), ...(job.firstMessageId ? { sourceMessageId: job.firstMessageId } : {}) });
+  }
+
+  restoreFirstMessages(): void {
+    for (const job of this.jobs.values()) this.publishFirstMessage(job);
   }
 
   private receipt(job: Job): ProjectChatReceipt {
@@ -129,6 +155,9 @@ export class CodexProjectChats {
       attemptId: attempt.id, attemptNumber: attempt.number,
       creationMethod: job.executorKind ?? 'companion',
       ...(job.firstMessageState ? { firstMessageState: job.firstMessageState } : {}),
+      ...(job.thread ? { firstMessageRequestId: job.id } : {}),
+      ...(job.firstTurnId ? { firstTurnId: job.firstTurnId } : {}),
+      ...(job.firstMessageId ? { firstMessageId: job.firstMessageId } : {}),
       canRetry: job.executorKind !== 'native' && job.state === 'failed' && attempt.number === 1 && job.approvalFailure?.attemptId === attempt.id,
       ...(job.approvalFailure ? { failureCode: 'approval_review_timeout' as const } : {}),
       state: job.state, ...(job.thread ? { thread: job.thread } : {}), ...(job.error ? { error: job.error } : {}),
@@ -148,13 +177,13 @@ export class CodexProjectChats {
     return job.executorKind === 'native' ? this.options.localExecutor : this.options.executor;
   }
 
-  private async requireSelection(hostId: string, selection?: CodexModelSelection): Promise<void> {
+  private async requireSelection(hostId: string, selection?: CodexModelSelection, hasImages = false): Promise<void> {
     if (!selection) return;
     if (!this.options.requireSelection) {
       throw new ConversationError('The model catalogue for this connection is unavailable. Refresh the connection before choosing a model.',
         503, 'catalogue_unavailable');
     }
-    await this.options.requireSelection(hostId, { ...selection }, false);
+    await this.options.requireSelection(hostId, { ...selection }, hasImages);
   }
 
   async projects(hostId: string) {
@@ -163,6 +192,7 @@ export class CodexProjectChats {
     const executor = hostId === 'local' && this.options.localExecutor ? this.options.localExecutor : this.options.executor;
     try { await executor.ready(); canCreate = true; } catch { /* Saved projects remain readable when creation is unavailable. */ }
     return { hostId, projects: projects.map(({ hostId: _host, ...project }) => ({ ...project, canCreate,
+      supportsFirstMessageAttachments: hostId === 'local' && !!this.options.localExecutor,
       ...(!canCreate ? { reason: hostId === 'local' && this.options.localExecutor
         ? 'Native chat creation is unavailable. Open Codex Desktop and reconnect.'
         : 'The Codex project-creation companion is unavailable. Open Codex Desktop or finish companion setup on the Mac.' } : {}) })) };
@@ -175,6 +205,12 @@ export class CodexProjectChats {
     if (!parsed.success) throw new ConversationError('Select a saved project and enter a first message of up to 20,000 characters. Titles allow 120 characters.', 400, 'invalid_chat_request');
     if (this.closed) throw new ConversationError('Chat creation is unavailable.', 503, 'creation_unavailable');
     const input = parsed.data;
+    parseMessageInput({ id: input.id, hostId: input.hostId, threadId: input.id, text: input.prompt,
+      attachments: input.attachments ?? [], ...(input.selection ? { selection: input.selection } : {}) });
+    if (input.attachments?.length === 0) delete input.attachments;
+    if (input.attachments?.length && (input.hostId !== 'local' || !this.options.localExecutor)) {
+      throw new ConversationError('This connection cannot create a chat with images. Select a Mac with native creation support.', 422, 'first_message_images_unsupported');
+    }
     const fingerprint = createHash('sha256').update(JSON.stringify(input)).digest('hex');
     const known = () => {
       const job = this.jobs.get(input.id);
@@ -184,7 +220,7 @@ export class CodexProjectChats {
     const first = known();
     if (first) return { receipt: this.receipt(first), duplicate: true };
     await this.options.catalog.require(input.hostId, input.projectId);
-    await this.requireSelection(input.hostId, input.selection);
+    await this.requireSelection(input.hostId, input.selection, !!input.attachments?.length);
     const second = known();
     if (second) return { receipt: this.receipt(second), duplicate: true };
     if ([...this.jobs.values()].filter(job => ['pending', 'creating'].includes(job.state)).length >= 10) {
@@ -205,6 +241,7 @@ export class CodexProjectChats {
     if (!isCodexHost(hostId) || !validProjectId(projectId) || !isThreadId(id)) throw new ConversationError('Select a valid chat creation request and project.', 400, 'invalid_chat_request');
     const job = this.jobs.get(id);
     if (!job || job.hostId !== hostId || job.projectId !== projectId) throw new ConversationError('This chat creation request was not accepted for this project.', 404, 'creation_not_found');
+    this.publishFirstMessage(job);
     return this.receipt(job);
   }
 
@@ -213,17 +250,35 @@ export class CodexProjectChats {
     const job = this.jobs.get(id)!;
     // A GET can recover a late result, including after restart. It cannot send.
     const executor = this.executor(job);
-    if (['creating', 'unknown'].includes(job.state) && executor && (job.executorKind === 'native' || job.executorThreadId) && !this.inflight.has(id)
+    const refreshModel = job.state === 'completed' && job.executorKind === 'native' && !!job.selection && !!job.thread && !!job.firstTurnId;
+    if ((['creating', 'unknown'].includes(job.state) || refreshModel) && executor && (job.executorKind === 'native' || job.executorThreadId) && !this.inflight.has(id)
       && !this.retryAdmissions.has(id) && !this.closed) {
       const attemptId = this.currentAttempt(job).id;
       const work = executor.recoverChat(this.execution(job)).then(result => {
         if (this.closed || this.currentAttempt(job).id !== attemptId) return;
-        this.observe(job, result); this.save(job);
+        if (refreshModel) this.refreshCompletedModel(job, result);
+        else { this.observe(job, result); this.save(job); }
       }).catch(() => { /* Preserve durable uncertainty when Desktop is unavailable. */ })
         .finally(() => this.inflight.delete(id));
       this.inflight.set(id, work); await work;
     }
     return this.receipt(job);
+  }
+
+  /** A later read may refine model evidence; it must not downgrade or retarget a completed creation. */
+  private refreshCompletedModel(job: Job, result: ProjectChatObservation): void {
+    if (result.state !== 'completed' || result.hostId !== job.hostId || result.thread.id !== job.thread?.id
+      || result.firstTurnId !== job.firstTurnId) return;
+    const evidence = modelEvidenceSchema.safeParse(result.modelEvidence);
+    if (!evidence.success || JSON.stringify(evidence.data) === JSON.stringify(job.modelEvidence)) return;
+    const updated: Job = { ...job, modelEvidence: evidence.data };
+    const previousWarning = creationModelWarning(job);
+    let notice = job.notice;
+    if (previousWarning && notice === previousWarning) notice = undefined;
+    else if (previousWarning && notice?.endsWith(` ${previousWarning}`)) notice = notice.slice(0, -previousWarning.length - 1);
+    updated.notice = [notice, creationModelWarning(updated)].filter(Boolean).join(' ') || undefined;
+    this.save(updated);
+    Object.assign(job, updated);
   }
 
   async retry(id: string, value: unknown): Promise<{ receipt: ProjectChatReceipt; duplicate: boolean }> {
@@ -264,7 +319,7 @@ export class CodexProjectChats {
         409, 'creation_retry_unavailable');
     }
     await this.options.catalog.require(job.hostId, job.projectId);
-    await this.requireSelection(job.hostId, job.selection);
+    await this.requireSelection(job.hostId, job.selection, !!job.attachments?.length);
     await this.options.executor.ready();
     if (this.closed || this.currentAttempt(job).id !== expectedAttemptId) {
       throw new ConversationError('The creation attempt changed. Read its current status.', 409, 'creation_attempt_conflict');
@@ -312,6 +367,7 @@ export class CodexProjectChats {
     const attempt = this.currentAttempt(job);
     return { id: job.id, hostId: job.hostId, projectId: job.projectId, prompt: job.prompt,
       ...(job.title ? { title: job.title } : {}), createdAt: job.createdAt,
+      ...(job.attachments?.length ? { attachments: structuredClone(job.attachments) } : {}),
       ...(job.executorThreadId ? { executorThreadId: job.executorThreadId } : {}), requestPath: job.requestPath,
       ...(job.selection ? { selection: { ...job.selection } } : {}),
       ...(attempt.number === 2 && attempt.previousFailure ? { retry: { attemptId: attempt.id, attemptNumber: 2 as const,
@@ -322,7 +378,8 @@ export class CodexProjectChats {
     const path = join(this.options.dataDir, 'requests', `${job.id}.json`);
     if (job.requestPath && job.requestPath !== path) throw new Error('Invalid immutable request path');
     const content = JSON.stringify({ requestId: job.id, hostId: job.hostId, projectId: job.projectId,
-      prompt: job.prompt, ...(job.title ? { title: job.title } : {}), ...(job.selection ? { selection: job.selection } : {}) });
+      prompt: job.prompt, ...(job.title ? { title: job.title } : {}), ...(job.selection ? { selection: job.selection } : {}),
+      ...(job.attachments?.length ? { attachments: job.attachments } : {}) });
     try { writeFileSync(path, content, { flag: 'wx', mode: 0o400 }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
     const info = lstatSync(path);
@@ -365,14 +422,8 @@ export class CodexProjectChats {
       const evidence = modelEvidenceSchema.safeParse(result.modelEvidence);
       if (evidence.success) job.modelEvidence = evidence.data;
       else delete job.modelEvidence;
-      if (job.selection) {
-        const verification = modelVerificationFor(job.selection, job.modelEvidence, true);
-        const warning = verification === 'different'
-          ? 'The chat was created, but Codex used different model settings or rerouted its first response. Continue in this chat instead of creating another one.'
-          : verification === 'unverified'
-            ? 'The chat was created, but Codex could not confirm the model settings of its first response. Continue in this chat instead of creating another one.' : undefined;
-        if (warning) job.notice = [job.notice, warning].filter(Boolean).join(' ');
-      }
+      const warning = creationModelWarning(job);
+      if (warning) job.notice = [job.notice, warning].filter(Boolean).join(' ');
       return;
     }
     if (result.state !== 'creating' || job.state === 'unknown') {
@@ -397,7 +448,7 @@ export class CodexProjectChats {
       job.state = 'failed'; job.error = 'The chat was not created. Refresh the project and reconnect Codex Desktop before trying again.';
       this.save(job); return;
     }
-    try { await this.requireSelection(job.hostId, job.selection); }
+    try { await this.requireSelection(job.hostId, job.selection, !!job.attachments?.length); }
     catch (error) {
       if (this.closed) return;
       const invalid = error instanceof ConversationError && error.status >= 400 && error.status < 500

@@ -202,8 +202,9 @@ export class RemoteHosts {
           throw new ConversationError('The model catalogue is temporarily unavailable.', 503, 'catalogue_unavailable');
         }
       };
+      let conversations: CodexConversations | undefined;
       const projectChats = new CodexProjectChats({ dataDir: join(settings.dataDir, 'project-chats'), catalog: projects,
-        requireSelection,
+        requireSelection, onFirstMessage: (input, evidence) => conversations?.adoptFirstMessage(input, evidence),
         localExecutor: new CodexNativeCreator({ dataDir: join(settings.dataDir, 'project-chats', 'native'), codexPath: nativeCodexPath,
           env, catalog: projects, connectNative, connectDesktop: connect }),
         executor: new CodexCompanionCreator({ helperThreadId: env.PETROGLYPHS_CODEX_CREATOR_THREAD_ID, connect, catalog: projects,
@@ -224,7 +225,7 @@ export class RemoteHosts {
           try { return await client.readSettings(hostId, threadId); }
           finally { client.close(); }
         } },
-        conversations: new CodexConversations({ dataDir: join(settings.dataDir, 'conversations'), legacyDataDir: settings.dataDir,
+        conversations: conversations = new CodexConversations({ dataDir: join(settings.dataDir, 'conversations'), legacyDataDir: settings.dataDir,
           connect, verifiedFirstMessage: (hostId, threadId) => projectChats.verifiedFirstMessage(hostId, threadId),
           requireTarget, requireSelection }),
         submissions: new DesktopSubmissions({
@@ -234,6 +235,7 @@ export class RemoteHosts {
           connect,
         }),
       };
+      projectChats.restoreFirstMessages();
     }
     return new RemoteHosts(new Map(configs.map(host => [host.id, host])),
       options.cachePath ?? join(env.CODEX_HOME || join(homedir(), '.codex'), '.codex-global-state.json'),

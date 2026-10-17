@@ -212,6 +212,78 @@ test('new local creation uses a durable native executor without a helper and pre
   f.controls.resolve(native(randomUUID(), remote)); await tick();
 });
 
+test('native creation retains first images and hands the same request into conversation recovery', async t => {
+  const captured = [], adopted = [], checks = [];
+  const result = native(randomUUID());
+  const localExecutor = { ready: async () => {}, close() {}, createChat: async input => { captured.push(input); return result; },
+    recoverChat: async () => result };
+  const f = await creationFixture(t, { localExecutor, requireSelection: async (...args) => checks.push(args),
+    onFirstMessage: (...args) => adopted.push(args) });
+  const attachments = [{ id: randomUUID(), name: 'Plan.png', mimeType: 'image/png',
+    dataBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=' }];
+  const input = message({ prompt: '', attachments, selection: { model: 'fixture-model', reasoningEffort: 'max' } });
+  await f.service.accept(input);
+  while (f.service.get('local', localProject, input.id).state !== 'completed') await tick();
+  assert.deepEqual(captured[0].attachments, attachments);
+  assert(checks.every(([, , hasImages]) => hasImages));
+  assert.equal(adopted[0][0].id, input.id);
+  assert.deepEqual(adopted[0][0].attachments, attachments);
+  assert.equal(adopted[0][1].turnId, result.firstTurnId);
+  const receipt = f.service.get('local', localProject, input.id);
+  assert.equal(receipt.firstMessageRequestId, input.id);
+  assert.equal(receipt.firstTurnId, result.firstTurnId);
+  assert.equal(receipt.firstMessageState, 'sent');
+  assert((await f.service.projects('local')).projects.every(project => project.supportsFirstMessageAttachments));
+  assert((await f.service.projects(remote)).projects.every(project => !project.supportsFirstMessageAttachments));
+  await assert.rejects(f.service.accept({ ...input, attachments: [{ ...attachments[0], name: 'Changed.png' }] }), error => error.code === 'id_conflict');
+  await assert.rejects(f.service.accept(message({ hostId: remote, projectId: remoteProject, attachments })),
+    error => error.code === 'first_message_images_unsupported');
+  f.service.close();
+  const restored = f.open(); restored.restoreFirstMessages();
+  assert.equal((await restored.accept(input)).duplicate, true);
+  assert.equal(captured.length, 1);
+  assert.deepEqual(adopted.at(-1)[0].attachments, attachments);
+});
+
+test('completed native creation refreshes exact first-turn model evidence without changing identity or sending again', async t => {
+  const selection = { model: 'fixture-model', reasoningEffort: 'max' };
+  const original = native(randomUUID());
+  let observation = { ...original, modelEvidence: { ...selection, reroutes: [] } };
+  let creates = 0, recoveries = 0;
+  const localExecutor = { ready: async () => {}, close() {},
+    createChat: async () => { creates++; return original; },
+    recoverChat: async () => { recoveries++; return observation; } };
+  const f = await creationFixture(t, { localExecutor, requireSelection: async () => {} });
+  const input = message({ selection });
+  await f.service.accept(input);
+  while (f.service.get('local', localProject, input.id).state !== 'completed') await tick();
+  await tick();
+  assert.equal(f.service.get('local', localProject, input.id).modelVerification, 'unverified');
+  const refreshed = await f.service.status('local', localProject, input.id);
+  assert.equal(refreshed.modelVerification, 'confirmed');
+  assert.equal(refreshed.notice, undefined);
+  assert.equal(refreshed.thread.id, original.thread.id);
+  assert.equal(refreshed.firstTurnId, original.firstTurnId);
+  assert.equal(creates, 1); assert.equal(recoveries, 1);
+
+  const rerouted = { ...selection, reroutes: [{ fromModel: selection.model, toModel: 'fallback-model', reason: 'capacity' }] };
+  observation = { ...original, firstTurnId: randomUUID(), modelEvidence: rerouted };
+  assert.equal((await f.service.status('local', localProject, input.id)).modelVerification, 'confirmed');
+  observation = { ...original, thread: { ...original.thread, id: randomUUID() }, modelEvidence: rerouted };
+  assert.equal((await f.service.status('local', localProject, input.id)).thread.id, original.thread.id);
+  observation = { state: 'unknown' };
+  assert.equal((await f.service.status('local', localProject, input.id)).state, 'completed');
+  observation = { ...original, modelEvidence: rerouted };
+  const later = await f.service.status('local', localProject, input.id);
+  assert.equal(later.modelVerification, 'different');
+  assert.match(later.notice, /rerouted/);
+  f.service.close();
+  const restored = f.open();
+  assert.deepEqual(restored.get('local', localProject, input.id).modelEvidence, rerouted);
+  assert.equal((await restored.accept(input)).duplicate, true);
+  assert.equal(creates, 1);
+});
+
 test('a legacy local job still recovers through its original companion after native creation is enabled', async t => {
   const f = await creationFixture(t);
   const input = message();
