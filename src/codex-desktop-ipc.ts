@@ -354,7 +354,8 @@ export class CodexDesktopIpc {
     const entry = this.entries.get(key(String(params.hostId), String(params.conversationId)));
     if (!entry) return;
     if (message.version !== 11 || typeof message.sourceClientId !== 'string' || !object(params.change)) {
-      this.invalidate(entry, new CodexDesktopIpcError('This Codex Desktop stream format is not supported.')); return;
+      this.invalidate(entry, new CodexDesktopIpcError('This Codex Desktop stream format is not supported.',
+        503, 'not-sent', 'protocol_mismatch')); return;
     }
     const change = params.change;
     try {

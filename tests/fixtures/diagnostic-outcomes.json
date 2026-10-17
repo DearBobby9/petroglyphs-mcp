@@ -1,0 +1,7 @@
+[
+  { "name": "normal", "evidence": "synthetic-regression-fixture", "expected": { "status": "verified_read", "operations": ["read_settings", "read_history"], "revision": 7 } },
+  { "name": "disconnected", "evidence": "synthetic-regression-fixture", "error": { "delivery": "not-sent", "code": "connection_closed" }, "expected": { "code": "connection_closed", "outcome": "not_sent", "handlingLocation": "desktop" } },
+  { "name": "unknown-delivery", "evidence": "synthetic-regression-fixture", "error": { "delivery": "unknown", "code": "request_timeout" }, "expected": { "code": "request_timeout", "outcome": "unknown", "handlingLocation": "desktop" } },
+  { "name": "takeover-unavailable", "evidence": "synthetic-regression-fixture", "error": { "delivery": "not-sent", "code": "owner_unavailable" }, "expected": { "code": "owner_unavailable", "outcome": "not_sent", "handlingLocation": "desktop" } },
+  { "name": "incompatible-protocol", "evidence": "synthetic-regression-fixture", "error": { "delivery": "not-sent", "code": "protocol_mismatch" }, "expected": { "code": "protocol_mismatch", "outcome": "not_sent", "handlingLocation": "desktop" } }
+]

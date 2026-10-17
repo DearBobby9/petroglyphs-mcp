@@ -139,6 +139,19 @@ test('IPC uses its own identity, frames split responses, refuses discovery, and 
   assert(f.requests.every(request => request.method !== 'thread-owner-discovery'));
 });
 
+test('an incompatible Desktop stream version reports protocol mismatch rather than a disconnected host', async t => {
+  const f = await fixture(t);
+  const ipc = await f.connect();
+  let failed;
+  const error = new Promise(resolve => { failed = resolve; });
+  const stop = await ipc.subscribe(host, thread, () => {}, failed);
+  f.publish([...f.sockets][0], { type: 'snapshot', revision: 2, conversationState: f.state }, { version: 12 });
+  const result = await error;
+  assert.equal(result.code, 'protocol_mismatch');
+  assert.equal(result.outcome, 'not_sent');
+  stop();
+});
+
 test('startImageTurn hydrates a fresh snapshot and sends the exact PNG to the fixed remote chat with inherited settings', async t => {
   const f = await fixture(t);
   const ipc = await f.connect();
