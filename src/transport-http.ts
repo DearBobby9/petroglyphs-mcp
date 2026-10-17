@@ -69,7 +69,7 @@ export async function startHttp(port: number): Promise<Server> {
   }) : undefined;
   let autoReply: CodexAutoReply | undefined;
   if (settings && process.env.PETROGLYPHS_LEGACY_SUBMISSIONS !== '0') {
-    try { autoReply = new CodexAutoReply(settings); }
+    try { autoReply = new CodexAutoReply(settings, { deferStart: true }); }
     catch { console.error('[petroglyphs] Legacy submission recovery is unavailable. Paired conversation routes remain enabled.'); }
   }
   const legacy = () => {
@@ -440,6 +440,7 @@ export async function startHttp(port: number): Promise<Server> {
     const closeServices = () => {
       if (closed) return;
       closed = true;
+      autoReply?.close();
       closeAdvertisement();
       bridgePairings?.close();
       remoteHosts.close();
@@ -451,6 +452,9 @@ export async function startHttp(port: number): Promise<Server> {
     const closeServers = (): Promise<void> => {
       if (closePromise) return closePromise;
       closeStarted = true;
+      // Stop new legacy admissions immediately, even while active HTTP requests
+      // are still draining before the sockets' close callbacks can complete.
+      autoReply?.close();
       const servers = [approvalListener, listener].filter((server): server is Server => Boolean(server));
       closePromise = new Promise<void>(resolveClose => {
         let remaining = servers.length;
@@ -522,6 +526,7 @@ export async function startHttp(port: number): Promise<Server> {
     };
 
     const announce = (actualPort: number) => {
+      autoReply?.start();
       if (bridgeConnection && port !== 0) void advertiseBridge(bridgeConnection).then(close => {
         if (closed) close(); else closeAdvertisement = close;
       }).catch(() => { console.error('[petroglyphs] Bonjour discovery is unavailable. Tailscale discovery remains enabled.'); });
@@ -565,6 +570,7 @@ export async function startHttp(port: number): Promise<Server> {
         return;
       }
       if (startup !== 'pending' || closeStarted) return;
+      listener.close = requestClose as Server['close'];
       announce(actualPort);
       startup = 'resolved';
       resolve(listener);

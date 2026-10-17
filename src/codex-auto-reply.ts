@@ -18,11 +18,13 @@ interface Job {
 
 export class CodexAutoReply {
   private busy = false;
+  private started = false;
+  private closed = false;
   private readonly jobs: Job[] = [];
   private readonly threads: CodexThreads;
   private readonly replyPolls = new Map<string, { checkedAt: number; inflight?: Promise<SubmissionStatus> }>();
 
-  constructor(private readonly settings: Settings) {
+  constructor(private readonly settings: Settings, options: { deferStart?: boolean } = {}) {
     if (!isAbsolute(settings.codexPath) || !isAbsolute(settings.dataDir)) throw new Error('Invalid Codex auto-reply configuration');
     this.threads = new CodexThreads(settings.codexPath);
     mkdirSync(settings.dataDir, { recursive: true, mode: 0o700 });
@@ -35,7 +37,19 @@ export class CodexAutoReply {
       this.jobs.push(job);
     }
     this.jobs.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    if (!options.deferStart) this.start();
+  }
+
+  start(): void {
+    if (this.started || this.closed) return;
+    this.started = true;
     void this.drain();
+  }
+
+  close(): void {
+    // An admitted CLI operation must finish with its original receipt. Stop
+    // only future dispatches; never cancel and replay an uncertain admission.
+    this.closed = true;
   }
 
   private save(job: Job): void {
@@ -111,9 +125,11 @@ export class CodexAutoReply {
   }
 
   async accept(submission: Submission, threadId: string): Promise<void> {
+    if (this.closed) throw new CodexRoutingError('Legacy submission service is closed.', 503);
     const bytes = Buffer.from(submission.imageBase64, 'base64');
     if (!bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new CodexRoutingError('Expected a PNG image.', 400);
     await this.threads.requireThread(threadId);
+    if (this.closed) throw new CodexRoutingError('Legacy submission service is closed.', 503);
     const imagePath = join(this.settings.dataDir, `${submission.id}.png`);
     writeFileSync(imagePath, bytes, { mode: 0o600, flag: 'wx' });
     const job: Job = { id: submission.id, threadId, imagePath, state: 'pending', createdAt: submission.timestamp, updatedAt: submission.timestamp };
@@ -129,10 +145,11 @@ export class CodexAutoReply {
   }
 
   private async drain(): Promise<void> {
-    if (this.busy) return;
+    if (this.busy || !this.started || this.closed) return;
     this.busy = true;
     try {
       for (const job of this.jobs) {
+        if (this.closed) break;
         if (job.state !== 'pending') continue;
         job.state = 'dispatching'; this.save(job);
         try {

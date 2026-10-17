@@ -72,6 +72,79 @@ test('malformed image URLs with long escaped runs return promptly', () => {
   assert(elapsed < 1000, 'malformed image parsing took ' + elapsed.toFixed(1) + 'ms');
 });
 
+test('code masking matches full delimiter runs, escapes and fenced blocks without hiding later images', () => {
+  const hidden = '![hidden](https://example.test/hidden.png)';
+  const visible = '![visible](https://example.test/visible.png)';
+  const cases = [
+    ['``' + hidden + ' ` literal `` ' + visible, ['visible']],
+    ['``' + visible + ' ```', ['visible']],
+    ['\\`' + visible + '`', ['visible']],
+    ['\\\\`' + hidden + '` ' + visible, ['visible']],
+    ['`' + hidden + '\\` ' + visible, ['visible']],
+    ['~~~md\n' + hidden + '\n~~~~ extra\n' + hidden + '\n~~~~\n' + visible, ['visible']],
+    ['```md\n' + hidden + '\n```\n' + visible, ['visible']],
+  ];
+  for (const [text, names] of cases) {
+    assert.deepEqual(resultImageInputs({ type: 'agentMessage', text }).map(image => image.name), names, text);
+  }
+});
+
+test('long unmatched code delimiters cannot stall conversation HTTP or leak image sources', { timeout: 10_000 }, async t => {
+  const f = await setup(t);
+  const runner = join(f.root, 'parser-http.mjs');
+  await writeFile(runner, `
+    import express from ${JSON.stringify(new URL('../node_modules/express/index.js', import.meta.url).href)};
+    import { CodexConversations } from ${JSON.stringify(new URL('../dist/codex-conversations.js', import.meta.url).href)};
+    import { installConversationRoutes } from ${JSON.stringify(new URL('../dist/codex-conversation-routes.js', import.meta.url).href)};
+    const thread = ${JSON.stringify(thread)};
+    let text;
+    const connection = {
+      readSnapshot: async () => {
+        process.send({ reading: true });
+        const turn = { turnId: 'turn', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', phase: 'final_answer', text }] };
+        return { hostId: 'local', threadId: thread, conversationState: { id: thread, hostId: 'local',
+          turnHistory: { history: { isComplete: true, islands: [{ entries: [{ key: 'turn', value: 'turn' }] }],
+            entitiesByKey: { turn } } } } };
+      },
+      startMessageTurn: async () => { throw Error('read-only fixture'); }, close: () => {},
+    };
+    const service = new CodexConversations({ dataDir: ${JSON.stringify(f.dataDir)},
+      connect: async () => connection, requireTarget: async () => {}, historyCacheBytes: 0 });
+    const app = express();
+    app.get('/health', (_req, res) => res.send('ok'));
+    app.use((req, res, next) => {
+      res.locals.autoReplyAuthorized = true;
+      text = req.query.kind === 'no-image'
+        ? 'prefix ' + String.fromCharCode(96).repeat(120000) + ' suffix'
+        : 'prefix ' + String.fromCharCode(96).repeat(5000) + ' ![visible](https://example.invalid/private.png)' + 'x'.repeat(5000);
+      next();
+    });
+    installConversationRoutes(app, service);
+    app.listen(0, '127.0.0.1', function() { process.send({ port: this.address().port }); });
+  `);
+  const child = fork(runner, { execArgv: [], stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+  const exited = once(child, 'exit');
+  t.after(async () => { child.kill('SIGKILL'); await exited; });
+  let errors = '';
+  child.stderr.on('data', bytes => { errors += bytes; });
+  const [{ port }] = await Promise.race([once(child, 'message'), exited.then(() => { throw Error(errors); })]);
+  for (const kind of ['with-image', 'no-image']) {
+    const reading = once(child, 'message');
+    const page = fetch(`http://127.0.0.1:${port}/api/codex/conversation?hostId=local&threadId=${thread}&kind=${kind}`,
+      { signal: AbortSignal.timeout(3000) }).then(response => { assert.equal(response.status, 200); return response.json(); });
+    page.catch(() => {});
+    await reading;
+    assert.equal(await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(750) }).then(response => response.text()), 'ok');
+    const result = await page;
+    assert.equal(result.messages.length, 1);
+    if (kind === 'with-image') {
+      assert.equal(result.messages[0].attachments.length, 1);
+      assert(!JSON.stringify(result).includes('example.invalid/private.png'));
+      assert(result.messages[0].text.includes('[Image: visible]'));
+    }
+  }
+});
+
 test('malformed nested angle and title candidates stay bounded and preserve a later image', () => {
   const malformedAngle = '![outer](<'.repeat(20_000);
   const nested = '![nested-valid](https://example.test/nested.png)';

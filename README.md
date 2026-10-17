@@ -103,7 +103,7 @@ The paired device API supports Codex conversations and project chat creation thr
 
 Message and creation requests accept an optional `selection: {model, reasoningEffort}`. The bridge validates it against that machine's model catalogue and saves it with the request. Changing the draft does not change queued messages. Reusing a request ID with different content or configuration returns a conflict. Without `selection`, existing chat settings or machine defaults apply.
 
-New local chats use the bundled Codex CLI's native `thread/start` interface without an assistant creation turn. The bridge saves the real thread ID, closes its native client, and opens `codex://threads/<id>` once. This official URI can show or focus the Mac's Codex window. After Desktop takes ownership, the bridge sends the first message through its existing Desktop connection. Normal project permissions remain inherited.
+New local chats use the bundled Codex CLI's native `thread/start` interface without an assistant creation turn. The bridge saves the real thread ID and uses `thread/name/set` even for untitled requests to persist the thread. After closing the creating client, a fresh native connection must read the same thread and verify its project, working directory and any returned roots before the bridge opens `codex://threads/<id>` once. This official URI can show or focus the Mac's Codex window. After Desktop takes ownership, the bridge sends the first message through its existing Desktop connection. Normal project permissions remain inherited. An uncertain naming or read-verification result blocks handoff; recovery only reads existing evidence and never automatically creates or sends again.
 
 Local creation uses `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex` by default. Set `PETROGLYPHS_NATIVE_CODEX_PATH` to an absolute bundled CLI path when that location differs. The selected Desktop project must have valid local roots and an unambiguous native identity. The bridge validates its explicit ID aliases and every root through `project/list` and `project/read`. Project lists supplement missing Desktop membership with native `thread/list` results for that exact project. Directory equality never establishes membership.
 
@@ -140,6 +140,8 @@ Set `PETROGLYPHS_BRIDGE_CONFIG` to a private JSON configuration file:
 The private Desktop adapter connects to `$CODEX_HOME/ipc/ipc.sock`, or `~/.codex/ipc/ipc.sock` by default. It discovers the owner of the requested host and thread. A different socket name or a missing separate application does not establish that integrated Codex is unavailable. Read [compatibility diagnostics](docs/codex-compatibility.md) for evidence boundaries.
 
 The startup layer owns pairing and the chat directory. Legacy `/api/submit` recovery uses its original files and worker. A legacy recovery error disables those compatibility operations without disabling paired conversation routes. `PETROGLYPHS_LEGACY_SUBMISSIONS=0` explicitly disables that worker while preserving its files. This option does not cancel existing Codex execution.
+
+Legacy pending recovery starts only after all HTTP listeners are ready. Failed startup or server shutdown prevents new legacy queue admissions immediately, including while active HTTP requests are draining. An already admitted CLI call may finish and save its original receipt; shutdown does not cancel its Codex execution or replay an unknown outcome. Undispatched pending receipts stay available for a later successful start.
 
 ## Source and verification
 

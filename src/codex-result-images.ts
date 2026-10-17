@@ -64,7 +64,7 @@ function withoutCode(text: string): string {
     const fenceMatch = /^ {0,3}(`{3,}|~{3,})/.exec(line);
     if (fence) {
       if (fenceMatch && fenceMatch[1][0] === fence.char && fenceMatch[1].length >= fence.length
-        && new RegExp(`^ {0,3}${fence.char === '`' ? '`' : '~'}{${fence.length},}\\s*$`).test(line)) fence = undefined;
+        && line.slice(fenceMatch[0].length).trim() === '') fence = undefined;
       return ' '.repeat(line.length);
     }
     if (fenceMatch) {
@@ -73,7 +73,40 @@ function withoutCode(text: string): string {
     }
     return line;
   }).join('\n');
-  return visible.replace(/(^|[^\\])(`+)([\s\S]*?)\2/g, (match, prefix: string) => prefix + ' '.repeat(match.length - prefix.length));
+
+  // Match whole delimiter runs of equal length. Indexing their next occurrence
+  // avoids retrying every suffix of an unmatched run with a backreference regex.
+  const runs: Array<{ start: number; end: number; escaped: boolean; next?: number }> = [];
+  let backslashes = 0;
+  for (let position = 0; position < visible.length;) {
+    if (visible[position] !== '`') {
+      backslashes = visible[position] === '\\' ? backslashes + 1 : 0;
+      position++;
+      continue;
+    }
+    const start = position;
+    while (visible[position] === '`') position++;
+    runs.push({ start, end: position, escaped: backslashes % 2 === 1 });
+    backslashes = 0;
+  }
+  const nextByLength = new Map<number, number>();
+  for (let index = runs.length - 1; index >= 0; index--) {
+    const length = runs[index].end - runs[index].start;
+    runs[index].next = nextByLength.get(length);
+    nextByLength.set(length, index);
+  }
+  const parts: string[] = [];
+  let cursor = 0;
+  for (let index = 0; index < runs.length; index++) {
+    const opener = runs[index];
+    if (opener.escaped || opener.next === undefined) continue;
+    const closer = runs[opener.next];
+    parts.push(visible.slice(cursor, opener.start), ' '.repeat(closer.end - opener.start));
+    cursor = closer.end;
+    index = opener.next;
+  }
+  parts.push(visible.slice(cursor));
+  return parts.join('');
 }
 
 type MarkdownImageMatch = [string, string, string] & { index: number };
