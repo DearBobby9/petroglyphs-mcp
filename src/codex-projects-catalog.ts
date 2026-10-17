@@ -37,6 +37,7 @@ const threadSchema = z.object({ thread_id: z.string().refine(isThreadId), displa
 
 /** Desktop's saved definitions and explicit memberships, never cwd inference. */
 export class CodexProjectsCatalog {
+  private readonly knownNativeMembership = new Map<string, { identity: string; expires: number; threads: Map<string, string> }>();
   private readonly statePath: string;
   private readonly databasePath: string;
   private readonly pageSize: number;
@@ -116,10 +117,13 @@ export class CodexProjectsCatalog {
   private async nativeMembership(state: State, project: SavedCodexProject): Promise<Map<string, string>> {
     if (project.hostId !== 'local' || !this.options.nativeProjectThreads) return new Map();
     const identity = this.localIdentity(state, project.id);
+    this.knownNativeMembership.delete(project.id);
     const result = await this.options.nativeProjectThreads(identity);
     if (!identity.candidateIds.includes(result.projectId) || result.threadIds.some(id => !isThreadId(id))
       || new Set(result.threadIds).size !== result.threadIds.length) throw new Error('Invalid native project membership');
-    return new Map(result.threadIds.map(id => [id, result.projectId]));
+    const threads = new Map(result.threadIds.map(id => [id, result.projectId]));
+    this.knownNativeMembership.set(project.id, { identity: JSON.stringify(identity), expires: Date.now() + 30_000, threads });
+    return threads;
   }
 
   private belongs(state: State, project: SavedCodexProject, threadId: string, serverProjectId: string | null): boolean {
@@ -155,9 +159,20 @@ export class CodexProjectsCatalog {
       }
     } catch { /* Explicit assignments and native list identities remain usable without the optional Desktop index. */ }
     finally { db?.close(); }
+    // Reuse exact, recently validated native membership; never scan projects or infer from cwd.
+    const known = new Map<string, Map<string, string>>();
+    for (const project of projects) {
+      const cached = this.knownNativeMembership.get(project.id);
+      if (!cached) continue;
+      try {
+        if (cached.expires > Date.now() && cached.identity === JSON.stringify(this.localIdentity(state, project.id))) {
+          known.set(project.id, cached.threads);
+        } else this.knownNativeMembership.delete(project.id);
+      } catch { this.knownNativeMembership.delete(project.id); }
+    }
     return { ...page, threads: page.threads.map(thread => {
       const { projectId: _nativeId, projectName: _name, ...safe } = thread;
-      const matches = projects.filter(project => this.belongs(state, project, thread.id, membership.get(thread.id) ?? null));
+      const matches = projects.filter(project => this.belongs(state, project, thread.id, membership.get(thread.id) ?? known.get(project.id)?.get(thread.id) ?? null));
       return matches.length === 1 ? { ...safe, projectId: matches[0].id, projectName: matches[0].name } : safe;
     }) };
   }

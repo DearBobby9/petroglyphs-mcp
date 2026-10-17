@@ -81,7 +81,8 @@ npx -y petroglyphs-mcp --port 3333
 |----------|--------|-------------|
 | `/api/health` | GET | Health check |
 | `/api/submit` | POST | Submit handwriting image + metadata |
-| `/mcp` | POST | MCP Streamable HTTP transport |
+| `/mcp` | POST | MCP Streamable HTTP transport (unpaired installations only) |
+| `/device/<token>/mcp` | POST | MCP transport for paired installations |
 
 ### Paired Codex chat controls
 
@@ -160,3 +161,5 @@ The companion iPad app lives at [petroglyphs-app](https://github.com/surfndev/pe
 ## License
 
 MIT
+
+When a device pairing configuration is present, HTTP MCP clients must use the same `/device/<token>/mcp` pairing prefix as the app API. Unauthenticated `/mcp` requests are rejected. Stdio clients are unaffected. Exports must remain inside the configured vault/export directory; symbolic-link subdirectories and file targets are rejected.

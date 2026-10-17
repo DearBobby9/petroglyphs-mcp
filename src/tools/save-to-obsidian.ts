@@ -1,5 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { writeExport } from '../safe-export.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { config } from '../config.js';
@@ -23,12 +22,6 @@ export function register(server: McpServer, sessionId: string): void {
           isError: true,
         };
       }
-
-      const targetDir = folder
-        ? join(config.vaultPath, folder)
-        : config.vaultPath;
-
-      await mkdir(targetDir, { recursive: true });
 
       const now = new Date();
       const dateStr = now.toISOString().split('T')[0];
@@ -54,13 +47,8 @@ export function register(server: McpServer, sessionId: string): void {
 
       // Embed image if requested
       if (embed_image && latest) {
-        const attachDir = join(config.vaultPath, 'attachments');
-        await mkdir(attachDir, { recursive: true });
-
         const imgFilename = `petroglyphs-${now.getTime()}.png`;
-        const imgPath = join(attachDir, imgFilename);
-        const imgBuffer = Buffer.from(latest.imageBase64, 'base64');
-        await writeFile(imgPath, imgBuffer);
+        await writeExport(config.vaultPath, 'attachments', imgFilename, Buffer.from(latest.imageBase64, 'base64'));
 
         body = `![[${imgFilename}]]\n\n${body}`;
       }
@@ -68,8 +56,7 @@ export function register(server: McpServer, sessionId: string): void {
       const md = `---\n${yamlLines.join('\n')}\n---\n\n${body}\n`;
 
       const sanitizedTitle = title.replace(/[/\\:*?"<>|]/g, '-');
-      const filePath = join(targetDir, `${sanitizedTitle}.md`);
-      await writeFile(filePath, md, 'utf-8');
+      const filePath = await writeExport(config.vaultPath, folder ?? '', `${sanitizedTitle}.md`, md);
 
       return {
         content: [{ type: 'text', text: `Saved to ${filePath}` }],

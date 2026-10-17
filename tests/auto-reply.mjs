@@ -219,7 +219,8 @@ try {
   const lifecycle = await trace();
   const started = lifecycle.filter(event => event.kind === 'start');
   assert.equal(started.length, beforeTimeout + 1);
-  assert(lifecycle.some(event => event.kind === 'stop' && event.pid === started.at(-1).pid), 'timed out lookup must stop its child process');
+  assert.throws(() => process.kill(started.at(-1).pid, 0),
+    error => error.code === 'ESRCH', 'timed out lookup must wait for child exit, including EOF exits');
   assert(!serverLogs.includes('PRIVATE_'), 'RPC and stderr details must not enter HTTP logs');
   assert(lifecycle.filter(event => event.kind === 'rpc').every(event => ['initialize', 'initialized', 'thread/list'].includes(event.method)));
 

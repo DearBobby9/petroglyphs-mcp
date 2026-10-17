@@ -1,0 +1,36 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, readFile, writeFile, symlink, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { config } from '../src/config.ts';
+import { store } from '../src/store.ts';
+import { register as obsidian } from '../src/tools/save-to-obsidian.ts';
+import { register as excalidraw } from '../src/tools/export-to-excalidraw.ts';
+
+test('real export handlers contain paths and reject directory and target symlinks', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'export-check-'));
+  const old = { vaultPath: config.vaultPath, exportPath: config.exportPath };
+  t.after(async () => { Object.assign(config, old); store.clear('export-test'); await rm(root, { recursive: true, force: true }); });
+  config.vaultPath = join(root, 'vault'); config.exportPath = join(root, 'exports');
+  const outside = join(root, 'outside'); await mkdir(outside); await mkdir(config.vaultPath);
+  const handlers = new Map(); const server = { tool(name, description, schema, handler) { handlers.set(name, handler); } };
+  obsidian(server, 'export-test'); excalidraw(server, 'export-test');
+  const note = handlers.get('save_to_obsidian'); const drawing = handlers.get('export_to_excalidraw');
+  store.addSubmission('export-test', { imageBase64: 'eA==', strokeMetadata: { strokes: [{ points: [{x:0,y:0,pressure:1}] }] } });
+  await assert.rejects(note({ title: 'escape', content: 'bad', folder: '../outside' }));
+  await assert.rejects(drawing({ filename: '../outside/escape' }));
+  await assert.rejects(drawing({ filename: join(outside, 'escape') }));
+  await symlink(outside, join(config.vaultPath, 'linked'));
+  await assert.rejects(note({ title: 'escape', content: 'bad', folder: 'linked' }));
+  await symlink(outside, join(config.vaultPath, 'attachments'));
+  await assert.rejects(note({ title: 'image', content: 'bad', embed_image: true }));
+  const original = join(outside, 'original'); await writeFile(original, 'preserved');
+  await symlink(original, join(config.vaultPath, 'note.md'));
+  await assert.rejects(note({ title: 'note', content: 'bad' }));
+  assert.equal(await readFile(original, 'utf8'), 'preserved');
+  await note({ title: 'valid', content: 'good', folder: 'nested/notes' });
+  assert.match(await readFile(join(config.vaultPath, 'nested/notes/valid.md'), 'utf8'), /good/);
+  await drawing({ filename: 'valid' });
+  assert.equal(JSON.parse(await readFile(join(config.exportPath, 'valid.excalidraw'), 'utf8')).type, 'excalidraw');
+});

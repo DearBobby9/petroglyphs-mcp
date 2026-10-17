@@ -88,8 +88,19 @@ test('paired identity and new routes initialize even when legacy receipt recover
     delete process.env.PETROGLYPHS_AUTO_REPLY_CONFIG;
     process.env.PETROGLYPHS_BRIDGE_CONFIG = config;
     process.env.PETROGLYPHS_LEGACY_SUBMISSIONS = '0';
+    process.env.PETROGLYPHS_CODEX_DESKTOP = '1';
     server = await startHttp(0);
     const independent = `http://127.0.0.1:${server.address().port}`;
+    for (const path of ['/mcp', '/mcp/', '/MCP']) {
+      assert.equal((await fetch(`${independent}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
+    }
+    const pairedMcp = await fetch(`${independent}/device/${token}/mcp`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    assert.notEqual(pairedMcp.status, 403);
+    assert.notEqual(pairedMcp.status, 404);
+    const modernHealth = await fetch(`${independent}/device/${token}/api/health`).then(r => r.json());
+    assert.equal(modernHealth.autoReply.enabled, false);
+    assert.equal(modernHealth.capabilities.conversations, true);
+
     const proof = await fetch(`${independent}/api/bridge/identity?${new URLSearchParams({ nonce, origin: independent })}`).then(r => r.json());
     assert.equal(proof.id, identity.id, 'configuration alias and worker opt-out preserve the existing pairing identity');
     assert.equal((await fetch(`${independent}/device/${token}/api/codex/hosts`)).status, 200);
@@ -98,6 +109,7 @@ test('paired identity and new routes initialize even when legacy receipt recover
     delete process.env.PETROGLYPHS_AUTO_REPLY_CONFIG;
     delete process.env.PETROGLYPHS_BRIDGE_CONFIG;
     delete process.env.PETROGLYPHS_LEGACY_SUBMISSIONS;
+    delete process.env.PETROGLYPHS_CODEX_DESKTOP;
     await rm(directory, { recursive: true, force: true });
   }
 });

@@ -57,11 +57,11 @@ export async function startHttp(port: number): Promise<Server> {
   };
   installBridgeIdentityRoute(app, bridgeConnection);
   app.use((req, res, next) => {
-    if (devicePrefix && req.path.startsWith(`${devicePrefix}/api/`)) {
+    if (devicePrefix && (req.path.startsWith(`${devicePrefix}/api/`) || req.path === `${devicePrefix}/mcp`)) {
       res.locals.autoReplyAuthorized = true;
       req.url = req.url.slice(devicePrefix.length);
     }
-    if (process.env.PETROGLYPHS_REQUIRE_DEVICE_AUTH === '1' && !res.locals.autoReplyAuthorized) {
+    if ((process.env.PETROGLYPHS_REQUIRE_DEVICE_AUTH === '1' || (settings && /^\/mcp\/?$/i.test(req.path))) && !res.locals.autoReplyAuthorized) {
       res.status(403).json({ error: 'A paired device URL is required.' });
       return;
     }
@@ -147,6 +147,8 @@ export async function startHttp(port: number): Promise<Server> {
       status: 'ok',
       ...(res.locals.autoReplyAuthorized ? { autoReply: autoReply?.status() ?? { enabled: false } } : {}),
       ...(bridge ? { bridge } : {}),
+      ...(res.locals.autoReplyAuthorized ? { capabilities: { conversations: Boolean(remoteHosts.conversations),
+        projects: Boolean(remoteHosts.projectChats), controls: Boolean(remoteHosts.controls) } } : {}),
       version: '0.1.0',
       submissions: store.getCount(DEFAULT_SESSION),
       activeSessions: store.getActiveSessionCount(),
@@ -407,7 +409,7 @@ export async function startHttp(port: number): Promise<Server> {
       console.error(`[petroglyphs]   Landing:   GET  http://localhost:${actualPort}/`);
       console.error(`[petroglyphs]   iPad API:  POST http://localhost:${actualPort}/api/submit`);
       console.error(`[petroglyphs]   Health:    GET  http://localhost:${actualPort}/api/health`);
-      console.error(`[petroglyphs]   MCP HTTP:  POST http://localhost:${actualPort}/mcp`);
+      console.error(`[petroglyphs]   MCP HTTP:  POST http://localhost:${actualPort}${settings ? "/device/<token>" : ""}/mcp`);
       resolve(listener);
     };
     const bindHost = process.env.PETROGLYPHS_BIND_HOST;

@@ -130,9 +130,16 @@ test('native membership fills null Desktop project IDs without overriding visibi
   const first = await catalog.listThreads('local', localProject);
   const second = await catalog.listThreads('local', localProject, { cursor: first.nextCursor });
   assert.deepEqual([...first.threads, ...second.threads].map(thread => thread.id), [f.ids[7], f.ids[4], f.ids[1], f.ids[0]]);
+  const nativePage = { threads: [{ id: f.ids[4], title: 'Native', cwd: localPath, updatedAt: 1 }], nextCursor: null };
+  const readsBeforeDescribe = reads;
+  assert.equal((await catalog.describeThreads('local', nativePage)).threads[0].projectId, localProject);
+  assert.equal(reads, readsBeforeDescribe, 'All chats must not scan native projects');
+  const exclusions = await catalog.describeThreads('local', { threads: [3, 5, 6].map(i => ({ id: f.ids[i], title: 'Explicit', cwd: localPath, updatedAt: 1 })) });
+  assert.deepEqual(exclusions.threads.map(thread => thread.projectId), ['other', undefined, undefined]);
   members = [];
   const current = await catalog.creationCandidates('local', localProject, new Date(0).toISOString());
   assert(!current.threads.some(thread => thread.id === f.ids[4]), 'native membership must be refreshed after removal');
+  assert.equal((await catalog.describeThreads('local', nativePage)).threads[0].projectId, undefined);
   const before = reads; await catalog.listThreads(remote, remoteProject); assert.equal(reads, before);
   unavailable = true;
   await assert.rejects(catalog.listThreads('local', localProject), error => error.code === 'project_chats_unavailable');

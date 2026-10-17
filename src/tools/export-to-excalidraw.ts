@@ -1,5 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { writeExport } from '../safe-export.js';
 import { randomUUID } from 'node:crypto';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -117,9 +116,7 @@ export function register(server: McpServer, sessionId: string): void {
       };
 
       const outName = filename ?? `petroglyphs-${Date.now()}`;
-      await mkdir(config.exportPath, { recursive: true });
-      const outPath = join(config.exportPath, `${outName}.excalidraw`);
-      await writeFile(outPath, JSON.stringify(doc, null, 2), 'utf-8');
+      const outPath = await writeExport(config.exportPath, '', `${outName}.excalidraw`, JSON.stringify(doc, null, 2));
 
       return {
         content: [{ type: 'text', text: `Exported ${elements.length} stroke(s) to ${outPath}` }],
