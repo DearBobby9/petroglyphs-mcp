@@ -286,6 +286,26 @@ test('busy targets preserve FIFO, pending survives restart, and another host can
   await assert.rejects(restored.accept(input('Unavailable', { hostId: 'remote-control:env_disabled' })), error => error.status === 404);
 });
 
+test('durable admission order survives identical timestamps, reversed IDs and clock rollback', async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ['Date'], now: 1_800_000_000_000 });
+  const first = input('First', { id: 'ffffffff-ffff-7fff-8fff-ffffffffffff' });
+  const second = input('Second', { id: '00000000-0000-7000-8000-000000000001' });
+  await f.service.accept(first);
+  await f.service.accept(second);
+  t.mock.timers.setTime(1_700_000_000_000);
+  const third = input('Third after clock rollback');
+  await f.service.accept(third);
+  const restored = f.restart();
+  for (const [index, expected] of [first, second, third].entries()) {
+    await restored.drain();
+    assert.equal(f.attempts[index]?.clientUserMessageId, expected.id);
+    f.turns.get(`${host}:${thread}`).at(-1).status = 'completed';
+  }
+  await restored.drain();
+  assert.equal(f.attempts.length, 3);
+});
+
 test('a crash after the durable dispatch boundary recovers as unknown and never repeats the send', async t => {
   const f = await fixture(t);
   f.mode = 'busy';

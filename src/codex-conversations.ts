@@ -42,6 +42,7 @@ const savedAttachmentSchema = z.object({ id: uuid, name: z.string().min(1).max(2
 const jobSchema = z.object({
   version: z.literal(1), id: uuid, hostId: host, threadId: uuid, fingerprint: sha, text: z.string().max(20_000),
   attachments: z.array(savedAttachmentSchema).max(4), createdAt: z.string().datetime(), updatedAt: z.string().datetime(),
+  enqueueSequence: z.number().int().nonnegative().safe().optional(),
   state: z.enum(['pending', 'dispatching', 'queued', 'running', 'completed', 'failed', 'unknown', 'cancelled']),
   waitReleasedAt: z.string().datetime().optional(),
   turnId: z.string().optional(), observedMessageId: z.string().optional(), turnFinished: z.boolean().optional(),
@@ -71,6 +72,7 @@ export class CodexConversations {
   private connection?: Promise<ConversationConnection>;
   private draining?: Promise<void>;
   private closed = false;
+  private nextSequence = 0;
   private readonly timer: NodeJS.Timeout;
 
   constructor(private readonly options: Options) {
@@ -95,7 +97,17 @@ export class CodexConversations {
         this.save(job);
       }
       return job;
-    }).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    }).sort((a, b) => {
+      // Old receipts have no recoverable admission order. Keep that legacy
+      // prefix stable, then order all new receipts by their durable sequence.
+      if (a.enqueueSequence === undefined && b.enqueueSequence === undefined) return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+      if (a.enqueueSequence === undefined) return -1;
+      if (b.enqueueSequence === undefined) return 1;
+      return a.enqueueSequence - b.enqueueSequence;
+    });
+    const sequences = loaded.flatMap(job => job.enqueueSequence === undefined ? [] : [job.enqueueSequence]);
+    if (new Set(sequences).size !== sequences.length) throw new Error('Duplicate conversation admission sequence');
+    this.nextSequence = sequences.length ? Math.max(...sequences) + 1 : 0;
     loaded.forEach(job => this.jobs.set(job.id, job));
     this.timer = setInterval(() => { void this.drain(); }, options.retryMs ?? 3000);
     this.timer.unref();
@@ -174,7 +186,9 @@ export class CodexConversations {
       throw new ConversationError('Too many messages are waiting. Let the existing messages finish before sending more.', 429, 'queue_full');
     }
     const now = new Date().toISOString();
+    if (!Number.isSafeInteger(this.nextSequence)) throw new ConversationError('Conversation admission sequence is exhausted.', 503, 'queue_unavailable');
     const job: Job = { version: 1, id: input.id, hostId: input.hostId, threadId: input.threadId, text: input.text,
+      enqueueSequence: this.nextSequence++,
       fingerprint, ...(input.selection ? { selection: { ...input.selection } } : {}),
       createdAt: now, updatedAt: now, state: 'pending', attachments: input.attachments.map(attachment => ({
         id: attachment.id, name: attachment.name, mimeType: attachment.mimeType,
