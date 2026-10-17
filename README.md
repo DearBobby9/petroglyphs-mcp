@@ -4,7 +4,9 @@ MCP server that bridges iPad handwriting input with LLMs. Captures handwriting a
 
 ## Quick Start (Claude Desktop + iPad)
 
-**Prerequisites:** [Node.js](https://nodejs.org) (v18+) and [Claude Desktop](https://claude.ai/download)
+**Prerequisites:** [Node.js](https://nodejs.org) 24 or later and [Claude Desktop](https://claude.ai/download) for this MCP setup.
+
+The paired Codex workflow uses Codex inside **ChatGPT Desktop**. It does not require a separate Codex application. Its configuration is described below.
 
 Add this to your `claude_desktop_config.json`:
 
@@ -83,15 +85,20 @@ npx -y petroglyphs-mcp --port 3333
 
 ### Paired Codex chat controls
 
-The paired device API also supports Codex conversations and project chat creation. These routes require the private device URL and an enabled Codex Desktop connection.
+The paired device API supports Codex conversations and project chat creation through ChatGPT Desktop. These routes require the private device URL and an enabled Codex connection.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/codex/models?hostId=…` | GET | Available models and reasoning levels from the selected machine |
 | `/api/codex/model-settings?hostId=…&threadId=…` | GET | The selected chat's current model settings |
 | `/api/codex/messages` | POST | Send text and images to a fixed chat |
-| `/api/codex/chats` | POST | Create a chat in a saved project with its first text message |
+| `/api/codex/chats` | POST | Create a saved-project chat with its first message; native local creation also accepts images |
 | `/api/codex/chats/:id/retry` | POST | Retry one verified companion approval timeout for the same creation request |
+| `/api/codex/messages/:id/release-wait?hostId=…&threadId=…` | POST | Release an uncertain request's local queue wait without resending |
+| `/api/codex/messages/:id/cancel?hostId=…&threadId=…` | POST | Cancel a message that remains pending before dispatch |
+| `/api/codex/diagnostics?hostId=…&threadId=…` | GET | Runtime versions, protocol baseline and actual host read results |
+| `/api/codex/controls?hostId=…&threadId=…` | GET | Target execution controls and known pending interaction kinds |
+| `/api/codex/controls/stop` | POST | Stop the explicitly named host, chat and turn when its capability is verified |
 
 Message and creation requests accept an optional `selection: {model, reasoningEffort}`. The bridge validates it against that machine's model catalogue and saves it with the request. Changing the draft does not change queued messages. Reusing a request ID with different content or configuration returns a conflict. Without `selection`, existing chat settings or machine defaults apply.
 
@@ -105,9 +112,46 @@ Receipts distinguish requested `selection` from `modelEvidence` observed in the 
 
 Creation receipts include `creationMethod`, `attemptId`, `attemptNumber`, and `canRetry`. A known created thread remains available when its first message has `firstMessageState: "not_sent"` or `"unknown"`. Native stage receipts are saved under the configured data directory's `project-chats/native` folder. Status reads recover matching message evidence without creating, opening, or sending again. An interrupted native creation never replays `thread/start`.
 
+Native first-message attachments use the same `{id,name,mimeType,dataBase64}` objects as conversation messages. Limits are four PNG/JPEG images, 10 MiB per image and 24 MiB total. The creation request saves their fixed bytes. `firstMessageRequestId` identifies their conversation receipt. `firstTurnId` and `firstMessageId` identify observed native history when available. Uncertain first sends join the durable conversation queue without a second dispatch. A definitely unsent first message stays available for draft recovery.
+
+Project entries expose `supportsFirstMessageAttachments`. It is true only for native local creation. The remote companion's official `create_thread` interface has no image argument. Its installed executor also rejects an empty prompt before creation, so an empty-chat workaround cannot preserve one complete first message. A direct bridge on another Mac would use that Mac's local native route and its own pairing identity. That deployment requires separate runtime validation.
+
+Messages have a durable admission sequence. Legacy receipts without a sequence retain a stable timestamp/ID order because their original same-millisecond order cannot be recovered. An uncertain request remains `unknown` after queue release and retains `waitReleasedAt` across restarts. Late results still update its original ID. Only `pending` requests can become `cancelled`.
+
 A companion retry requires `{hostId, projectId, attemptId}` matching the receipt. It preserves the original request ID, first message, title, and model settings. The bridge permits one retry only when native approval records prove that the previous creation call timed out before execution. The complete project catalogue must also contain no creation candidate. It rechecks that evidence before dispatch and submits through the same official approval path. Repeated retry submissions return the existing attempt. Uncertain execution outcomes remain read-only and cannot be replayed. Native creation does not use this companion retry mechanism.
 
 Remote messages, images and replies use Codex Remote Connection. The current external Desktop interface does not expose its remote model catalogue. A separate [read-only Tailscale model agent](docs/model-catalog-agent.md) supplies that metadata. It does not send messages or run inference. Unavailable catalogues disable explicit model selection instead of substituting another machine's models.
+
+### Paired bridge startup
+
+Set `PETROGLYPHS_BRIDGE_CONFIG` to a private JSON configuration file:
+
+```json
+{
+  "deviceToken": "YOUR_EXISTING_32_OR_MORE_HEX_CHARACTER_TOKEN",
+  "codexPath": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+  "dataDir": "/absolute/private/bridge-data"
+}
+```
+
+`PETROGLYPHS_AUTO_REPLY_CONFIG` remains a compatible alias. Reuse the existing token and data directory when upgrading. The token determines bridge identity independently of its network address. Set `PETROGLYPHS_CODEX_DESKTOP=1` to enable conversation services. `PETROGLYPHS_NATIVE_CODEX_PATH` and `PETROGLYPHS_MODEL_CODEX_PATH` override their executable paths when required.
+
+The private Desktop adapter connects to `$CODEX_HOME/ipc/ipc.sock`, or `~/.codex/ipc/ipc.sock` by default. It discovers the owner of the requested host and thread. A different socket name or a missing separate application does not establish that integrated Codex is unavailable. Read [compatibility diagnostics](docs/codex-compatibility.md) for evidence boundaries.
+
+The startup layer owns pairing and the chat directory. Legacy `/api/submit` recovery uses its original files and worker. A legacy recovery error disables those compatibility operations without disabling paired conversation routes. `PETROGLYPHS_LEGACY_SUBMISSIONS=0` explicitly disables that worker while preserving its files. This option does not cancel existing Codex execution.
+
+## Source and verification
+
+Production TypeScript lives in `src/`. `npm run build` writes `dist/`; generated output is not a second source tree. Tests in `tests/*.mjs` use either source modules through `tsx` or the freshly built distribution. Run the complete maintained suite with:
+
+```sh
+npm ci
+npm test
+```
+
+CI uses the same command on Node 24. Tests create temporary local fixtures and servers. A sandbox must permit loopback listeners and test child processes. No test requires an iPad, a real model turn, or deployment credentials.
+
+Runtime and device validation remain separate. See [execution controls](docs/execution-controls.md) and [history polling measurements](docs/history-performance.md). The dated document in `docs/research/` records an earlier inspection, not the current compatibility baseline.
 
 ## iPad App
 
