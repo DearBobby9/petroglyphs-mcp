@@ -2,13 +2,14 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { CodexRoutingError, CodexThreads, isThreadId, type ThreadQuery } from './codex-threads.js';
+import { CodexRoutingError, CodexThreads, isThreadId } from './codex-threads.js';
+import type { BridgeSettings } from './bridge-settings.js';
 import { AWAITING_CONFIRMATION_NOTICE, LEGACY_INTERRUPTED_ERROR, submissionMarker,
   type ReplyMessage, type SubmissionState, type SubmissionStatus, type SubmissionSummary } from './codex-replies.js';
 import type { Submission } from './types.js';
 
 const execFileAsync = promisify(execFile);
-interface Settings { threadId?: string; deviceToken: string; codexPath: string; dataDir: string }
+type Settings = Pick<BridgeSettings, 'codexPath' | 'dataDir'>;
 interface Job {
   id: string; threadId: string; imagePath: string; state: SubmissionState; createdAt: string; updatedAt: string;
   receipt?: string; error?: string; turnId?: string; replyScanCursor?: string | null; replyTurnCursor?: string;
@@ -16,16 +17,13 @@ interface Job {
 }
 
 export class CodexAutoReply {
-  readonly devicePrefix: string;
   private busy = false;
   private readonly jobs: Job[] = [];
   private readonly threads: CodexThreads;
   private readonly replyPolls = new Map<string, { checkedAt: number; inflight?: Promise<SubmissionStatus> }>();
 
   constructor(private readonly settings: Settings) {
-    if (!/^[0-9a-f]{32,}$/.test(settings.deviceToken)
-      || !isAbsolute(settings.codexPath) || !isAbsolute(settings.dataDir)) throw new Error('Invalid Codex auto-reply configuration');
-    this.devicePrefix = `/device/${settings.deviceToken}`;
+    if (!isAbsolute(settings.codexPath) || !isAbsolute(settings.dataDir)) throw new Error('Invalid Codex auto-reply configuration');
     this.threads = new CodexThreads(settings.codexPath);
     mkdirSync(settings.dataDir, { recursive: true, mode: 0o700 });
     for (const name of readdirSync(settings.dataDir).filter(n => n.endsWith('.json'))) {
@@ -46,8 +44,6 @@ export class CodexAutoReply {
     writeFileSync(`${path}.tmp`, JSON.stringify(job, null, 2), { mode: 0o600 });
     renameSync(`${path}.tmp`, path);
   }
-
-  listThreads(query: ThreadQuery) { return this.threads.list(query); }
 
   listSubmissions(threadId: string): { submissions: SubmissionSummary[] } {
     if (!isThreadId(threadId)) throw new CodexRoutingError('A valid threadId is required.', 400);
@@ -157,7 +153,3 @@ export class CodexAutoReply {
   }
 }
 
-export function loadAutoReply(): CodexAutoReply | null {
-  const path = process.env.PETROGLYPHS_AUTO_REPLY_CONFIG;
-  return path ? new CodexAutoReply(JSON.parse(readFileSync(path, 'utf8')) as Settings) : null;
-}

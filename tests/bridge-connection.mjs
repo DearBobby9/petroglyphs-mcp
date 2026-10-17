@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BridgeConnection } from '../dist/bridge-connection.js';
@@ -64,6 +64,40 @@ test('only identity challenge bypasses required pairing; connection metadata sta
     if (server) await new Promise(resolve => server.close(resolve));
     delete process.env.PETROGLYPHS_REQUIRE_DEVICE_AUTH;
     delete process.env.PETROGLYPHS_AUTO_REPLY_CONFIG;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('paired identity and new routes initialize even when legacy receipt recovery fails', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'petroglyphs-isolated-bridge-'));
+  const config = join(directory, 'settings.json'), dataDir = join(directory, 'data');
+  await mkdir(dataDir);
+  await writeFile(join(dataDir, 'corrupt-legacy.json'), 'unrecoverable legacy receipt');
+  await writeFile(config, JSON.stringify({ deviceToken: token, codexPath: '/not-used/codex', dataDir }));
+  process.env.PETROGLYPHS_AUTO_REPLY_CONFIG = config;
+  let server;
+  try {
+    server = await startHttp(0);
+    const base = `http://127.0.0.1:${server.address().port}`, paired = `${base}/device/${token}`;
+    const identity = await fetch(`${base}/api/bridge/identity?${new URLSearchParams({ nonce, origin: base })}`).then(r => r.json());
+    assert.equal(identity.id, new BridgeConnection(token).id);
+    assert.equal((await fetch(`${paired}/api/codex/hosts`)).status, 200);
+    assert.equal((await fetch(`${paired}/api/codex/conversation?hostId=local&threadId=00000000-0000-7000-8000-000000000001`)).status, 503);
+    assert.equal((await fetch(`${paired}/api/codex/submissions?threadId=00000000-0000-7000-8000-000000000001`)).status, 503);
+    await new Promise(resolve => server.close(resolve)); server = undefined;
+    delete process.env.PETROGLYPHS_AUTO_REPLY_CONFIG;
+    process.env.PETROGLYPHS_BRIDGE_CONFIG = config;
+    process.env.PETROGLYPHS_LEGACY_SUBMISSIONS = '0';
+    server = await startHttp(0);
+    const independent = `http://127.0.0.1:${server.address().port}`;
+    const proof = await fetch(`${independent}/api/bridge/identity?${new URLSearchParams({ nonce, origin: independent })}`).then(r => r.json());
+    assert.equal(proof.id, identity.id, 'configuration alias and worker opt-out preserve the existing pairing identity');
+    assert.equal((await fetch(`${independent}/device/${token}/api/codex/hosts`)).status, 200);
+  } finally {
+    if (server) await new Promise(resolve => server.close(resolve));
+    delete process.env.PETROGLYPHS_AUTO_REPLY_CONFIG;
+    delete process.env.PETROGLYPHS_BRIDGE_CONFIG;
+    delete process.env.PETROGLYPHS_LEGACY_SUBMISSIONS;
     await rm(directory, { recursive: true, force: true });
   }
 });

@@ -4,8 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import express from 'express';
 import cors from 'cors';
-import { loadAutoReply } from './codex-auto-reply.js';
-import { CodexRoutingError, isThreadId } from './codex-threads.js';
+import { CodexAutoReply } from './codex-auto-reply.js';
+import { loadBridgeSettings } from './bridge-settings.js';
+import { CodexRoutingError, CodexThreads, isThreadId } from './codex-threads.js';
 import { RemoteHostError, RemoteHosts } from './remote-hosts.js';
 import { installConversationRoutes } from './codex-conversation-routes.js';
 import { installProjectRoutes } from './codex-project-routes.js';
@@ -40,14 +41,25 @@ const betaSignups: BetaSignup[] = [];
 
 export async function startHttp(port: number): Promise<Server> {
   const app = express();
-  const autoReply = loadAutoReply();
-  const remoteHosts = await RemoteHosts.fromEnvironment();
-  const bridgeConnection = autoReply ? new BridgeConnection(autoReply.devicePrefix.slice('/device/'.length)) : undefined;
+  const settings = loadBridgeSettings();
+  const devicePrefix = settings ? `/device/${settings.deviceToken}` : undefined;
+  const localThreads = settings ? new CodexThreads(settings.codexPath) : undefined;
+  const remoteHosts = await RemoteHosts.fromEnvironment({ bridgeSettings: settings });
+  const bridgeConnection = settings ? new BridgeConnection(settings.deviceToken) : undefined;
+  let autoReply: CodexAutoReply | undefined;
+  if (settings && process.env.PETROGLYPHS_LEGACY_SUBMISSIONS !== '0') {
+    try { autoReply = new CodexAutoReply(settings); }
+    catch { console.error('[petroglyphs] Legacy submission recovery is unavailable. Paired conversation routes remain enabled.'); }
+  }
+  const legacy = () => {
+    if (!autoReply) throw new ConversationError('Legacy drawing submission recovery is unavailable. Existing files are preserved.', 503, 'legacy_submissions_unavailable');
+    return autoReply;
+  };
   installBridgeIdentityRoute(app, bridgeConnection);
   app.use((req, res, next) => {
-    if (autoReply && req.path.startsWith(`${autoReply.devicePrefix}/api/`)) {
+    if (devicePrefix && req.path.startsWith(`${devicePrefix}/api/`)) {
       res.locals.autoReplyAuthorized = true;
-      req.url = req.url.slice(autoReply.devicePrefix.length);
+      req.url = req.url.slice(devicePrefix.length);
     }
     if (process.env.PETROGLYPHS_REQUIRE_DEVICE_AUTH === '1' && !res.locals.autoReplyAuthorized) {
       res.status(403).json({ error: 'A paired device URL is required.' });
@@ -133,7 +145,7 @@ export async function startHttp(port: number): Promise<Server> {
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       status: 'ok',
-      ...(res.locals.autoReplyAuthorized ? { autoReply: autoReply?.status() } : {}),
+      ...(res.locals.autoReplyAuthorized ? { autoReply: autoReply?.status() ?? { enabled: false } } : {}),
       ...(bridge ? { bridge } : {}),
       version: '0.1.0',
       submissions: store.getCount(DEFAULT_SESSION),
@@ -157,7 +169,7 @@ export async function startHttp(port: number): Promise<Server> {
 
   app.get('/api/codex/hosts', async (_req, res) => {
     res.set('Cache-Control', 'no-store');
-    if (!autoReply || !res.locals.autoReplyAuthorized) {
+    if (!settings || !res.locals.autoReplyAuthorized) {
       res.status(403).json({ error: 'A paired device URL is required to access Codex connections.' });
       return;
     }
@@ -173,7 +185,7 @@ export async function startHttp(port: number): Promise<Server> {
 
   app.get('/api/codex/threads', async (req, res) => {
     res.set('Cache-Control', 'no-store');
-    if (!autoReply || !res.locals.autoReplyAuthorized) {
+    if (!settings || !res.locals.autoReplyAuthorized) {
       res.status(403).json({ error: 'A paired device URL is required to access Codex chats.' });
       return;
     }
@@ -192,7 +204,7 @@ export async function startHttp(port: number): Promise<Server> {
         res.json(await remoteHosts.projectChats.listThreads(hostId, projectId as string, query));
         return;
       }
-      res.json(hostId === 'local' ? await autoReply.listThreads(query) : await remoteHosts.listThreads(hostId, query));
+      res.json(hostId === 'local' ? await localThreads!.list(query) : await remoteHosts.listThreads(hostId, query));
     } catch (error) {
       const known = error instanceof CodexRoutingError || error instanceof RemoteHostError;
       res.status(known ? error.status : 503)
@@ -202,7 +214,7 @@ export async function startHttp(port: number): Promise<Server> {
 
   app.get('/api/codex/submissions', async (req, res) => {
     res.set('Cache-Control', 'no-store');
-    if (!autoReply || !res.locals.autoReplyAuthorized) {
+    if (!settings || !res.locals.autoReplyAuthorized) {
       res.status(403).json({ error: 'A paired device URL is required to recover Codex submissions.' });
       return;
     }
@@ -212,7 +224,7 @@ export async function startHttp(port: number): Promise<Server> {
       return;
     }
     try {
-      res.json(hostId === 'local' ? autoReply.listSubmissions(threadId) : await remoteHosts.listSubmissions(hostId, threadId));
+      res.json(hostId === 'local' ? legacy().listSubmissions(threadId) : await remoteHosts.listSubmissions(hostId, threadId));
     } catch (error) {
       const known = error instanceof CodexRoutingError || error instanceof RemoteHostError;
       res.status(known ? error.status : 503)
@@ -222,7 +234,7 @@ export async function startHttp(port: number): Promise<Server> {
 
   app.get('/api/codex/submissions/:id', async (req, res) => {
     res.set('Cache-Control', 'no-store');
-    if (!autoReply || !res.locals.autoReplyAuthorized) {
+    if (!settings || !res.locals.autoReplyAuthorized) {
       res.status(403).json({ error: 'A paired device URL is required to read Codex replies.' });
       return;
     }
@@ -232,7 +244,7 @@ export async function startHttp(port: number): Promise<Server> {
       return;
     }
     try {
-      res.json(hostId === 'local' ? await autoReply.getSubmission(req.params.id) : await remoteHosts.submission(hostId, req.params.id));
+      res.json(hostId === 'local' ? await legacy().getSubmission(req.params.id) : await remoteHosts.submission(hostId, req.params.id));
     } catch (error) {
       const known = error instanceof CodexRoutingError || error instanceof RemoteHostError;
       res.status(known ? error.status : 503)
@@ -297,8 +309,8 @@ export async function startHttp(port: number): Promise<Server> {
       combo: combo ?? null,
     };
 
-    if (autoReply && res.locals.autoReplyAuthorized) {
-      try { await autoReply.accept(submission, threadId as string); }
+    if (res.locals.autoReplyAuthorized) {
+      try { await legacy().accept(submission, threadId as string); }
       catch (error) {
         if (error instanceof CodexRoutingError) {
           res.status(error.status).json({ error: error.message });

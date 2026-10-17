@@ -19,6 +19,7 @@ import { CodexNativeCreator, readNativeProjectMembership } from './codex-native-
 import { ConversationError } from './codex-message-input.js';
 import { CodexDiagnostics, runtimeDiagnosticsReader } from './codex-diagnostics.js';
 import { CodexExecutionControls } from './codex-execution-controls.js';
+import { loadBridgeSettings, type BridgeSettings } from './bridge-settings.js';
 
 const hostIdPattern = /^remote-control:env_[A-Za-z0-9_-]{1,128}$/;
 const maxResponseBytes = 4 * 1024 * 1024;
@@ -87,6 +88,7 @@ interface Options {
   cachePath?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
+  bridgeSettings?: BridgeSettings;
 }
 
 interface DesktopRuntime {
@@ -176,10 +178,8 @@ export class RemoteHosts {
     const configs = await configuredHosts(env.PETROGLYPHS_REMOTE_CONFIG);
     let desktop: DesktopRuntime | undefined;
     if (env.PETROGLYPHS_CODEX_DESKTOP === '1') {
-      if (!env.PETROGLYPHS_AUTO_REPLY_CONFIG) throw new Error('Desktop routing needs a paired device configuration');
-      const settings = JSON.parse(await readFile(env.PETROGLYPHS_AUTO_REPLY_CONFIG, 'utf8')) as { dataDir?: unknown; codexPath?: unknown };
-      if (typeof settings.dataDir !== 'string' || !isAbsolute(settings.dataDir)
-        || typeof settings.codexPath !== 'string' || !isAbsolute(settings.codexPath)) throw new Error('Invalid Desktop receipt configuration');
+      const settings = options.bridgeSettings ?? loadBridgeSettings(env);
+      if (!settings) throw new Error('Desktop routing needs a paired device configuration');
       const catalog = new CodexDesktopCatalog({ env });
       const localThreads = new CodexThreads(settings.codexPath);
       const connect = () => CodexDesktopIpc.connect({ timeoutMs: 12_000, maxFrameBytes: 256 * 1024 * 1024 });
