@@ -91,6 +91,18 @@ test('saved projects are host-bound and thread filtering uses explicit membershi
   assert.equal(candidates.truncated, false);
 });
 
+test('all-chat metadata uses official membership and agrees with project navigation', async t => {
+  const f = await catalogFixture(t);
+  const source = { threads: f.ids.slice(0, 8).map(id => ({ id, title: 'Local saved', cwd: localPath, updatedAt: 123 })), nextCursor: 'unchanged' };
+  const page = await f.catalog.describeThreads('local', source);
+  assert.equal(page.nextCursor, source.nextCursor);
+  assert.deepEqual(page.threads.filter(thread => thread.projectId === localProject).map(thread => thread.id), [f.ids[0], f.ids[1], f.ids[7]]);
+  assert.equal(page.threads.find(thread => thread.id === f.ids[3]).projectId, 'other');
+  assert(page.threads.filter(thread => [f.ids[2], f.ids[4], f.ids[5], f.ids[6]].includes(thread.id)).every(thread => thread.projectName === undefined));
+  const projectPage = await f.catalog.listThreads('local', localProject);
+  assert(projectPage.threads.every(thread => thread.projectName === 'Local saved' && thread.projectId === localProject));
+});
+
 test('native identity retains every root and accepts aliases only from the current local profile', async t => {
   const f = await catalogFixture(t);
   f.state['local-projects'][localProject].rootPaths.push('/second/workspace');

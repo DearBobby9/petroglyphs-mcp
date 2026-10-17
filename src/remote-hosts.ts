@@ -93,6 +93,7 @@ interface Options {
 
 interface DesktopRuntime {
   catalog: CodexDesktopCatalog;
+  projects: CodexProjectsCatalog;
   submissions: DesktopSubmissions;
   conversations: CodexConversations;
   projectChats: CodexProjectChats;
@@ -218,7 +219,7 @@ export class RemoteHosts {
       const runtimeDiagnostics = runtimeDiagnosticsReader({ codexPath: settings.codexPath, nativeCodexPath,
         modelCodexPath: env.PETROGLYPHS_MODEL_CODEX_PATH ?? settings.codexPath, buildCommit: env.PETROGLYPHS_BUILD_COMMIT });
       desktop = {
-        catalog,
+        catalog, projects,
         projectChats,
         diagnostics: new CodexDiagnostics({ runtime: runtimeDiagnostics, connect, requireTarget, catalog: models }),
         controls: new CodexExecutionControls({ runtime: runtimeDiagnostics, connect, requireTarget }),
@@ -325,6 +326,12 @@ export class RemoteHosts {
     const parsed = threadPageSchema.safeParse(result);
     if (!parsed.success) throw new RemoteHostError('The remote service returned an invalid chat list.', 503);
     return parsed.data;
+  }
+
+  async describeThreads(hostId: string, page: ThreadPage): Promise<ThreadPage> {
+    if (!this.desktop) return page;
+    try { return await this.desktop.projects.describeThreads(hostId, page); }
+    catch { return { ...page, threads: page.threads.map(({ projectId: _id, projectName: _name, ...thread }) => thread) }; }
   }
 
   async submit(hostId: string, payload: RemoteSubmitPayload): Promise<RemoteReceipt> {

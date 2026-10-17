@@ -138,6 +138,30 @@ export class CodexProjectsCatalog {
     return false;
   }
 
+  async describeThreads(hostId: string, page: ThreadPage): Promise<ThreadPage> {
+    const state = await this.state();
+    const projects = state.projects.filter(project => project.hostId === hostId);
+    const membership = new Map(page.threads.flatMap(thread => thread.projectId ? [[thread.id, thread.projectId] as const] : []));
+    let db: DatabaseSync | undefined;
+    try {
+      if (page.threads.length) {
+        const { DatabaseSync } = await import('node:sqlite');
+        db = new DatabaseSync(this.databasePath, { readOnly: true });
+        db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 2000');
+        for (const row of db.prepare(`SELECT thread_id, project_id FROM local_thread_catalog WHERE host_id = ?
+          AND thread_id IN (${page.threads.map(() => '?').join(',')})`).all(hostId, ...page.threads.map(thread => thread.id))) {
+          if (typeof row.thread_id === 'string' && typeof row.project_id === 'string') membership.set(row.thread_id, row.project_id);
+        }
+      }
+    } catch { /* Explicit assignments and native list identities remain usable without the optional Desktop index. */ }
+    finally { db?.close(); }
+    return { ...page, threads: page.threads.map(thread => {
+      const { projectId: _nativeId, projectName: _name, ...safe } = thread;
+      const matches = projects.filter(project => this.belongs(state, project, thread.id, membership.get(thread.id) ?? null));
+      return matches.length === 1 ? { ...safe, projectId: matches[0].id, projectName: matches[0].name } : safe;
+    }) };
+  }
+
   async listThreads(hostId: string, projectId: string, query: ThreadQuery = {}): Promise<ThreadPage> {
     if (!isCodexHost(hostId) || !validProjectId(projectId)) throw new ConversationError('Select a valid Codex project and connection.', 400, 'invalid_project');
     if (query.search !== undefined && (typeof query.search !== 'string' || query.search.length > 200)) throw new ConversationError('Search must contain at most 200 characters.', 400, 'invalid_search');
@@ -171,7 +195,8 @@ export class CodexProjectsCatalog {
         && (!search || `${row.display_title}\n${row.cwd ?? ''}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
         && (!cursor || row.source_updated_at < cursor.updatedAt || (row.source_updated_at === cursor.updatedAt && row.thread_id < cursor.threadId)));
       const threads: CodexThread[] = filtered.slice(0, this.pageSize).map(row => ({ id: row.thread_id,
-        title: row.display_title.trim() || '未命名聊天', cwd: row.cwd ?? '', updatedAt: row.source_updated_at }));
+        title: row.display_title.trim() || '未命名聊天', cwd: row.cwd ?? '', updatedAt: row.source_updated_at,
+        projectId: project.id, projectName: project.name }));
       const last = threads.at(-1);
       return { threads, nextCursor: filtered.length > this.pageSize && last ? Buffer.from(JSON.stringify({
         v: 1, hostId, projectId, search, updatedAt: last.updatedAt, threadId: last.id,

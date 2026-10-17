@@ -11,6 +11,7 @@ const pageSchema = z.object({
     name: z.string().nullable().optional(),
     cwd: z.string(),
     updatedAt: z.number().finite(),
+    projectId: z.string().nullable().optional(),
     parentThreadId: z.string().nullable().optional(),
     ephemeral: z.boolean().optional(),
     source: z.unknown(),
@@ -23,6 +24,8 @@ export interface CodexThread {
   title: string;
   cwd: string;
   updatedAt: number;
+  projectId?: string;
+  projectName?: string;
 }
 
 export interface ThreadQuery { search?: string; cursor?: string }
@@ -180,6 +183,7 @@ export class CodexThreads {
           title: thread.name?.trim() || '未命名聊天',
           cwd: thread.cwd,
           updatedAt: thread.updatedAt,
+          ...(thread.projectId ? { projectId: thread.projectId } : {}),
         })),
       nextCursor: parsed.data.nextCursor,
     };

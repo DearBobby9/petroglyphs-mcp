@@ -204,7 +204,8 @@ export async function startHttp(port: number): Promise<Server> {
         res.json(await remoteHosts.projectChats.listThreads(hostId, projectId as string, query));
         return;
       }
-      res.json(hostId === 'local' ? await localThreads!.list(query) : await remoteHosts.listThreads(hostId, query));
+      const page = hostId === 'local' ? await localThreads!.list(query) : await remoteHosts.listThreads(hostId, query);
+      res.json(await remoteHosts.describeThreads(hostId, page));
     } catch (error) {
       const known = error instanceof CodexRoutingError || error instanceof RemoteHostError;
       res.status(known ? error.status : 503)
