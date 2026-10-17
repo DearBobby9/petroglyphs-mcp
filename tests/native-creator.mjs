@@ -17,8 +17,9 @@ async function fixture(t, selection = { model: 'selected-model', reasoningEffort
   const identity = { projectId: input.projectId, rootPaths: ['/project/one', '/project/two'], candidateIds: ['legacy-project', 'native-project'] };
   const threadId = randomUUID(), turnId = randomUUID();
   const controls = { nativeProjectId: 'native-project', nativeModel: selection?.model ?? 'native-default',
-    nativeEffort: selection?.reasoningEffort ?? null, publishOnSend: true };
+    nativeEffort: selection?.reasoningEffort ?? null, nativeThreadName: null, publishOnSend: true };
   const events = [], requests = [], sends = [];
+  let nativeConnections = 0;
   let turns = [];
   const receiptPath = join(root, `${input.id}.json`);
   const receipt = () => JSON.parse(readFileSync(receiptPath, 'utf8'));
@@ -29,24 +30,33 @@ async function fixture(t, selection = { model: 'selected-model', reasoningEffort
       { id: randomUUID(), type: 'agentMessage', phase: 'final_answer', text: 'Done' }] }]; };
   const options = { dataDir: root, codexPath: '/fixture/codex', adoptionMs: 0,
     catalog: { nativeLocalIdentity: async () => identity },
-    connectNative: async () => ({ close: async () => { events.push('native-close'); },
+    connectNative: async () => {
+      const role = nativeConnections++ === 0 ? 'creator' : 'verifier';
+      return { close: async () => { events.push(role === 'creator' ? 'native-close' : 'native-verifier-close'); },
       request: async (method, params) => {
-        requests.push({ method, params });
+        requests.push({ method, params, role });
         if (method === 'project/list') return { data: [{ id: 'native-project', roots: identity.rootPaths.map(path => ({ path })) }], nextCursor: null };
         if (method === 'project/read') return { project: { id: 'native-project', roots: identity.rootPaths.map(path => ({ path })) } };
         if (method === 'thread/start') {
           assert.equal(receipt().stage, 'creation_requested'); events.push('thread-start');
           if (controls.nativeError) throw controls.nativeError;
-          return { thread: { id: threadId, name: null, cwd: identity.rootPaths[0], projectId: controls.nativeProjectId, updatedAt: 100 },
+          return { thread: { id: threadId, name: controls.nativeThreadName, cwd: identity.rootPaths[0], projectId: controls.nativeProjectId, updatedAt: 100 },
             cwd: identity.rootPaths[0], runtimeWorkspaceRoots: identity.rootPaths,
             model: controls.nativeModel, reasoningEffort: controls.nativeEffort };
         }
-        if (method === 'thread/name/set') { assert.equal(receipt().thread.id, threadId); return {}; }
+        if (method === 'thread/name/set') { assert.equal(role, 'creator'); assert.equal(receipt().thread.id, threadId); return {}; }
+        if (method === 'thread/read') {
+          assert.equal(role, 'verifier');
+          if (controls.persistenceReadError) throw controls.persistenceReadError;
+          return { thread: { id: threadId, name: null, cwd: identity.rootPaths[0], projectId: controls.nativeProjectId, updatedAt: 100 },
+            cwd: identity.rootPaths[0], runtimeWorkspaceRoots: controls.nativeReadRoots ?? identity.rootPaths };
+        }
         assert.fail(`Unexpected native method ${method}`);
-      } }),
+      } };
+    },
     openThread: async id => {
       assert.equal(id, threadId); assert.equal(receipt().thread.id, threadId);
-      assert.equal(events.at(-1), 'native-close'); events.push('open');
+      assert.equal(events.at(-1), 'native-verifier-close'); events.push('open');
       if (controls.openError) throw controls.openError;
     },
     connectDesktop: async () => ({ close() {}, readSnapshot: async (hostId, id) => {
@@ -75,13 +85,23 @@ test('native creation saves the real ID, closes stdio, opens once, then sends th
   assert.equal(params.projectId, 'native-project'); assert.deepEqual(params.runtimeWorkspaceRoots, f.identity.rootPaths);
   assert.equal(params.model, f.input.selection.model); assert.deepEqual(params.config, { model_reasoning_effort: 'max' });
   for (const name of ['approvalPolicy', 'approvalsReviewer', 'sandbox', 'permissions', 'developerInstructions', 'dynamicTools']) assert.equal(name in params, false);
-  assert.deepEqual(f.events, ['thread-start', 'native-close', 'open', 'send']);
+  assert.deepEqual(f.events, ['thread-start', 'native-close', 'native-verifier-close', 'open', 'send']);
   assert.equal(f.sends[0].clientUserMessageId, f.input.id); assert.equal(f.sends[0].text, f.input.prompt);
   assert.deepEqual(f.sends[0].selection, f.input.selection); assert.deepEqual(f.sends[0].attachments, []);
   assert.equal(f.receipt().thread.id, f.threadId);
   await Promise.all([f.creator.createChat(f.input), f.creator.recoverChat(f.input)]);
   assert.equal(f.requests.filter(request => request.method === 'thread/start').length, 1); assert.equal(f.sends.length, 1);
   assert.equal(f.events.filter(event => event === 'open').length, 1);
+});
+
+test('an omitted title still commits through native thread/name/set and saves the fallback title', async t => {
+  const f = await fixture(t);
+  f.controls.nativeThreadName = '';
+  delete f.input.title;
+  assert.equal((await f.creator.createChat(f.input)).state, 'completed');
+  const naming = f.requests.find(request => request.method === 'thread/name/set');
+  assert.equal(naming.role, 'creator'); assert.equal(naming.params.name, '未命名聊天');
+  assert.equal(f.receipt().thread.title, '未命名聊天');
 });
 
 test('native first images stay fixed across an uncertain acknowledgement and recover without another send', async t => {
@@ -122,6 +142,18 @@ test('a lost thread/start response survives restart and duplicate create without
   assert.equal(f.events.includes('open'), false); assert.equal(f.sends.length, 0);
 });
 
+test('a fresh native reader must confirm persistence before Desktop open or first-message send', async t => {
+  const f = await fixture(t); f.controls.persistenceReadError = new NativeAppServerError('unknown');
+  const result = await f.creator.createChat(f.input);
+  assert.equal(result.state, 'created'); assert.equal(result.thread.id, f.threadId);
+  assert.equal(result.firstMessageState, 'not_sent');
+  assert.match(result.notice, /could not confirm that it was saved/i);
+  assert.equal(f.receipt().diagnosticCode, 'native_persistence_unavailable');
+  assert.equal(f.requests.find(request => request.method === 'thread/read').params.includeTurns, false);
+  assert.equal(f.events.includes('open'), false); assert.equal(f.sends.length, 0);
+  assert.equal(f.receipt().thread.id, f.threadId);
+});
+
 test('failed Desktop adoption preserves the created thread and read-only recovery never opens or sends', async t => {
   const f = await fixture(t); f.controls.readError = new CodexDesktopIpcError('No owner', 503, 'not-sent', 'owner_unavailable');
   const result = await f.creator.createChat(f.input);
@@ -143,6 +175,8 @@ test('a lost first-message acknowledgement recovers only its exact client messag
   assert.equal((await restored.recoverChat(f.input)).firstMessageState, 'unknown');
   f.publish(); const recovered = await restored.recoverChat(f.input);
   assert.equal(recovered.state, 'completed'); assert.equal(recovered.firstTurnId, f.turnId);
+  assert.match(result.notice, /has not confirmed the first message/i);
+  assert.doesNotMatch(result.notice, /first message was not sent/i);
   assert.equal(f.sends.length, 1); assert.equal(f.events.filter(event => event === 'open').length, 1);
 });
 
@@ -151,6 +185,7 @@ test('a created thread with mismatched native project metadata is retained witho
   const result = await f.creator.createChat(f.input);
   assert.equal(result.state, 'created'); assert.equal(result.projectVerified, false); assert.equal(result.thread.id, f.threadId);
   assert.equal(f.receipt().thread.id, f.threadId); assert.equal(f.sends.length, 0); assert.equal(f.events.includes('open'), false);
+  assert.equal(f.requests.some(request => request.method === 'thread/name/set'), false);
 });
 
 test('native project resolution rejects root drift, ambiguous aliases and incomplete paginated membership', async () => {

@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { ProjectCreationNotSentError } from './codex-companion-creator.js';
 import { historyMessages, historyTurns, record } from './codex-conversation-history.js';
-import { CodexDesktopIpcError, readTurnModelEvidence, type CodexDesktopIpc, type DesktopSnapshot } from './codex-desktop-ipc.js';
+import { CodexDesktopIpcError, readTurnModelEvidence, type CodexDesktopIpc, type DesktopIpcErrorCode, type DesktopSnapshot } from './codex-desktop-ipc.js';
 import { CodexNativeAppServer, type NativeCreationClient } from './codex-native-app-server.js';
 import { modelEvidenceSchema } from './codex-model-selection.js';
 import type { ProjectChatExecution, ProjectChatExecutor, ProjectChatObservation } from './codex-project-chats.js';
@@ -24,12 +24,19 @@ interface Options {
 const projectSchema = z.object({ id: z.string().refine(validProjectId), roots: z.array(z.object({ path: z.string().refine(isAbsolute) })).min(1).max(128) });
 const threadSchema = z.object({ id: z.string().refine(isThreadId), title: z.string(), cwd: z.string(), updatedAt: z.number().finite() });
 const settingsSchema = z.object({ model: z.string().min(1).max(256), reasoningEffort: z.string().min(1).max(64).nullable() }).strict();
+const desktopDiagnosticCodes = [
+  'desktop_unavailable', 'owner_unavailable', 'follower_timeout', 'request_timeout',
+  'connection_closed', 'protocol_mismatch', 'desktop_rejected', 'invalid_receipt',
+  'invalid_model_selection', 'model_settings_unavailable', 'capability_unverified',
+] as const satisfies readonly DesktopIpcErrorCode[];
+const diagnosticCodeSchema = z.enum(['native_persistence_unavailable', ...desktopDiagnosticCodes]);
 const receiptSchema = z.object({ version: z.literal(1), id: z.string().refine(isThreadId), hostId: z.literal('local'),
   projectId: z.string().refine(validProjectId), fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   createdAt: z.string().datetime(), updatedAt: z.string().datetime(), nativeProjectId: z.string().refine(validProjectId),
   rootPaths: z.array(z.string().refine(isAbsolute)).min(1).max(128),
   stage: z.enum(['prepared', 'creation_requested', 'created', 'desktop_open_requested', 'first_message_requested', 'completed']),
   thread: threadSchema.optional(), projectVerified: z.boolean().optional(), effectiveSettings: settingsSchema.optional(),
+  diagnosticCode: diagnosticCodeSchema.optional(),
   firstTurnId: z.string().refine(isThreadId).optional(), firstMessageId: z.string().optional(), modelEvidence: modelEvidenceSchema.optional(),
 }).strict();
 type NativeReceipt = z.infer<typeof receiptSchema>;
@@ -40,6 +47,7 @@ function fingerprint(input: ProjectChatExecution): string {
     ...(input.attachments?.length ? { attachments: input.attachments } : {}) })).digest('hex');
 }
 const sameRoots = (left: string[], right: string[]) => left.length === right.length && left.every((root, index) => root === right[index]);
+const diagnosticCodeSet: ReadonlySet<string> = new Set(desktopDiagnosticCodes);
 
 /** Validates explicit aliases against both the complete native list and a fresh project/read. */
 export async function resolveNativeProject(client: NativeCreationClient, identity: NativeLocalProjectIdentity): Promise<string> {
@@ -128,6 +136,51 @@ export class CodexNativeCreator implements ProjectChatExecutor {
     this.activeDesktop.add(client); return client;
   }
 
+  private desktopDiagnosticCode(error: unknown): DesktopIpcErrorCode | undefined {
+    if (!(error instanceof CodexDesktopIpcError) || !diagnosticCodeSet.has(error.code)) return;
+    return error.code;
+  }
+
+  private saveDiagnostic(receipt: NativeReceipt, code: NativeReceipt['diagnosticCode']): void {
+    if (!code) return;
+    receipt.diagnosticCode = code;
+    this.save(receipt);
+  }
+
+  /**
+   * A native thread/start response is not sufficient evidence that the thread
+   * was committed to the shared store. The verifier is intentionally a fresh
+   * app-server connection, after the creator connection has closed, so a
+   * successful read proves that the next owner can find the same thread.
+   */
+  private async verifyNativePersistence(receipt: NativeReceipt): Promise<boolean> {
+    if (!receipt.thread) return false;
+    let verifier: NativeCreationClient | undefined;
+    try {
+      verifier = await this.connectNative();
+      const response = record(await verifier.request('thread/read', { threadId: receipt.thread.id, includeTurns: false }));
+      const thread = record(response?.thread);
+      if (!response || !thread || thread.id !== receipt.thread.id || thread.projectId !== receipt.nativeProjectId
+        || thread.cwd !== receipt.rootPaths[0]) throw new Error('Native thread persistence could not be verified');
+      if (Object.hasOwn(response, 'cwd') && response.cwd !== receipt.rootPaths[0]) throw new Error('Native thread cwd could not be verified');
+
+      // Current native responses expose roots at the top level. Accept the
+      // thread-level shape as well for older/newer app-server builds, but if a
+      // response claims to expose roots, malformed or drifting roots fail shut.
+      let roots: unknown;
+      if (Object.hasOwn(response, 'runtimeWorkspaceRoots')) roots = response.runtimeWorkspaceRoots;
+      else if (Object.hasOwn(thread, 'runtimeWorkspaceRoots')) roots = thread.runtimeWorkspaceRoots;
+      if (roots !== undefined && (!Array.isArray(roots) || !roots.every(root => typeof root === 'string')
+        || !sameRoots(roots, receipt.rootPaths))) throw new Error('Native thread roots could not be verified');
+      return true;
+    } catch {
+      this.saveDiagnostic(receipt, 'native_persistence_unavailable');
+      return false;
+    } finally {
+      if (verifier) { await verifier.close(); this.activeNative.delete(verifier); }
+    }
+  }
+
   async ready(): Promise<void> {
     const client = await this.connectNative();
     try {
@@ -172,6 +225,7 @@ export class CodexNativeCreator implements ProjectChatExecutor {
     if (this.read(input)) return this.recoverChat(input);
     let receipt: NativeReceipt | undefined;
     let native: NativeCreationClient | undefined;
+    let nativeFailure = false;
     try {
       const identity = await this.options.catalog.nativeLocalIdentity(input.projectId);
       native = await this.connectNative();
@@ -188,7 +242,7 @@ export class CodexNativeCreator implements ProjectChatExecutor {
         ...(input.selection ? { model: input.selection.model, config: { model_reasoning_effort: input.selection.reasoningEffort } } : {}) }));
       const created = record(response?.thread);
       if (!isThreadId(created?.id)) return { state: 'unknown' };
-      receipt.thread = { id: created.id, title: typeof created.name === 'string' ? created.name : '未命名聊天',
+      receipt.thread = { id: created.id, title: typeof created.name === 'string' && created.name.trim() ? created.name : '未命名聊天',
         cwd: typeof created.cwd === 'string' ? created.cwd : '',
         updatedAt: typeof created.updatedAt === 'number' && Number.isFinite(created.updatedAt) ? created.updatedAt : Date.now() / 1000 };
       receipt.stage = 'created';
@@ -200,18 +254,28 @@ export class CodexNativeCreator implements ProjectChatExecutor {
       // Never close the creator or expose a first-message write before saving
       // the real thread ID, even when later response validation fails.
       this.save(receipt);
+      // Do not rename a thread whose native project identity or settings did
+      // not validate. The response may describe an unexpected project, and a
+      // title write would mutate that unrelated thread.
       if (!receipt.projectVerified || !receipt.effectiveSettings || this.closed) return this.observation(receipt);
-      if (input.title) {
-        await native.request('thread/name/set', { threadId: created.id, name: input.title });
-        receipt.thread.title = input.title; this.save(receipt);
-      }
-    } catch (error) {
+      // Naming a native thread is also the durable commit trigger on the
+      // bundled CLI. Always issue it, including when the request omitted a
+      // title, so untitled creations survive the creator process closing.
+      const requestedTitle = input.title ?? receipt.thread.title;
+      const title = requestedTitle.trim() ? requestedTitle : '未命名聊天';
+      await native.request('thread/name/set', { threadId: created.id, name: title });
+      receipt.thread.title = title; this.save(receipt);
+    } catch {
       if (!receipt || receipt.stage === 'prepared') throw new ProjectCreationNotSentError();
-      return this.observation(receipt);
+      nativeFailure = true;
     } finally {
       if (native) { await native.close(); this.activeNative.delete(native); }
     }
-    if (!receipt?.thread || this.closed) return receipt ? this.observation(receipt) : { state: 'unknown' };
+    if (!receipt?.thread || this.closed || nativeFailure) return receipt ? this.observation(receipt) : { state: 'unknown' };
+    // The creator connection is closed above on purpose. A second connection
+    // must be able to read the same ID before Desktop is asked to own it.
+    if (!await this.verifyNativePersistence(receipt)) return this.observation(receipt);
+    if (!receipt.projectVerified || !receipt.effectiveSettings || this.closed) return this.observation(receipt);
     let desktop: Awaited<ReturnType<Options['connectDesktop']>> | undefined;
     try {
       receipt.stage = 'desktop_open_requested'; this.save(receipt);
@@ -234,25 +298,39 @@ export class CodexNativeCreator implements ProjectChatExecutor {
         if (error instanceof CodexDesktopIpcError && error.outcome === 'not_sent') {
           receipt.stage = 'desktop_open_requested'; this.save(receipt);
         }
+        const code = this.desktopDiagnosticCode(error);
+        if (code) this.saveDiagnostic(receipt, code);
         return await this.recoverChat(input);
       }
       if (result.clientUserMessageId !== input.id || !isThreadId(result.turnId)) return this.observation(receipt);
       receipt.stage = 'completed'; receipt.firstTurnId = result.turnId; this.save(receipt);
       try { return await this.reconcile(input, receipt, await desktop.readSnapshot('local', receipt.thread.id)); }
       catch { return this.observation(receipt); }
-    } catch { return this.observation(receipt); }
+    } catch (error) {
+      // Keep only a fixed, reviewed category in the durable receipt. Native
+      // and Desktop error strings can contain paths, account data, or other
+      // local diagnostics and must never cross the API boundary.
+      this.saveDiagnostic(receipt, this.desktopDiagnosticCode(error) ?? 'desktop_unavailable');
+      return this.observation(receipt);
+    }
     finally { if (desktop) { desktop.close(); this.activeDesktop.delete(desktop); } }
   }
 
   private async waitForOwner(desktop: Awaited<ReturnType<Options['connectDesktop']>>, threadId: string): Promise<DesktopSnapshot> {
     const deadline = Date.now() + (this.options.adoptionMs ?? 20_000);
+    let lastError: unknown;
     while (!this.closed) {
       try { const snapshot = await desktop.readSnapshot('local', threadId); this.validateSnapshot(snapshot, threadId); return snapshot; }
-      catch {
-        if (Date.now() >= deadline) throw new Error('Codex Desktop has not taken over the created chat.');
+      catch (error) {
+        lastError = error;
+        if (Date.now() >= deadline) {
+          if (error instanceof CodexDesktopIpcError) throw error;
+          throw new Error('Codex Desktop has not taken over the created chat.');
+        }
         await delay(this.options.pollMs ?? 250, undefined, { signal: this.abort.signal });
       }
     }
+    if (lastError instanceof CodexDesktopIpcError) throw lastError;
     throw new Error('Native creator is closed');
   }
 
@@ -266,9 +344,21 @@ export class CodexNativeCreator implements ProjectChatExecutor {
     if (receipt.stage === 'completed' && receipt.firstTurnId) return { state: 'completed', hostId: 'local', thread: receipt.thread,
       firstTurnId: receipt.firstTurnId, ...(receipt.firstMessageId ? { firstMessageId: receipt.firstMessageId } : {}),
       ...(receipt.modelEvidence ? { modelEvidence: receipt.modelEvidence } : {}) };
+    const firstMessageState = receipt.stage === 'first_message_requested' ? 'unknown' : 'not_sent';
+    const notice = !receipt.projectVerified
+      ? 'The chat was created, but its project settings could not be confirmed. Its first message was not sent. Check the created chat in Codex Desktop.'
+      : firstMessageState === 'unknown'
+        ? 'The chat was created, but Codex has not confirmed the first message. Check this chat before sending again.'
+        : receipt.diagnosticCode === 'native_persistence_unavailable'
+          ? 'The chat was created, but Codex could not confirm that it was saved. Its first message was not sent. Check the created chat in Codex Desktop.'
+          : receipt.diagnosticCode === 'owner_unavailable'
+            ? 'The chat was created, but Codex Desktop could not take ownership. Its first message was not sent. Check the created chat in Codex Desktop.'
+            : receipt.diagnosticCode
+              ? 'The chat was created, but Codex Desktop was unavailable. Its first message was not sent. Check the created chat in Codex Desktop.'
+              : undefined;
     return { state: 'created', hostId: 'local', thread: receipt.thread, projectVerified: receipt.projectVerified === true,
-      firstMessageState: receipt.stage === 'first_message_requested' ? 'unknown' : 'not_sent',
-      ...(!receipt.projectVerified ? { notice: 'The chat was created, but its project settings could not be confirmed. Its first message was not sent. Check the created chat in Codex Desktop.' } : {}) };
+      firstMessageState,
+      ...(notice ? { notice } : {}) };
   }
 
   private async reconcile(input: ProjectChatExecution, receipt: NativeReceipt, snapshot: DesktopSnapshot): Promise<ProjectChatObservation> {

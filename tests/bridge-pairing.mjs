@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDecipheriv, createECDH, createHmac, hkdfSync } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { request } from 'node:http';
+import { networkInterfaces, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import express from 'express';
 import { BridgeConnection } from '../src/bridge-connection.ts';
 import { BridgeDiscovery } from '../src/bridge-discovery.ts';
 import { BridgePairings, installBridgePairingRoutes, loopbackApprovalRequest } from '../src/bridge-pairing.ts';
+import { startHttp } from '../src/transport-http.ts';
 
 const token = 'e'.repeat(64);
 
@@ -193,4 +197,72 @@ test('invalid origins, invalid curve points, oversized bodies and request floods
     assert.equal(receipts.filter(result => result.error?.code === 'pairing_busy').length, 2);
     assert.equal(f.approvals.length, 5);
   } finally { await f.close(); }
+});
+
+for (const ipv6Only of [false, true]) test(`an explicit ${ipv6Only ? 'IPv6 loopback' : 'private'} bind keeps a local approval socket and preserves the approval boundary`, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'petroglyphs-pairing-bind-'));
+  const token = 'f'.repeat(32);
+  const config = join(directory, 'bridge.json');
+  await writeFile(config, JSON.stringify({ deviceToken: token, codexPath: '/not-used/codex', dataDir: join(directory, 'data') }));
+  const bindAddress = ipv6Only ? '::1' : Object.values(networkInterfaces()).flatMap(entries => entries ?? [])
+    .find(entry => entry.family === 'IPv4' && !entry.internal)?.address ?? '127.0.0.2';
+  const saved = {
+    bridgeConfig: process.env.PETROGLYPHS_BRIDGE_CONFIG,
+    autoReplyConfig: process.env.PETROGLYPHS_AUTO_REPLY_CONFIG,
+    bindHost: process.env.PETROGLYPHS_BIND_HOST,
+    requireAuth: process.env.PETROGLYPHS_REQUIRE_DEVICE_AUTH,
+    legacy: process.env.PETROGLYPHS_LEGACY_SUBMISSIONS,
+  };
+  let server;
+  process.env.PETROGLYPHS_BRIDGE_CONFIG = config;
+  delete process.env.PETROGLYPHS_AUTO_REPLY_CONFIG;
+  process.env.PETROGLYPHS_BIND_HOST = bindAddress;
+  process.env.PETROGLYPHS_REQUIRE_DEVICE_AUTH = '1';
+  process.env.PETROGLYPHS_LEGACY_SUBMISSIONS = '0';
+  try {
+    try { server = await startHttp(0); }
+    catch (error) {
+      if (bindAddress === '127.0.0.2' && error?.code === 'EADDRNOTAVAIL') {
+        t.skip('No nonloopback IPv4 interface is available for the listener fixture.');
+        return;
+      }
+      throw error;
+    }
+    const address = server.address();
+    assert.equal(address.address, bindAddress);
+    const port = address.port;
+    const pairingPath = `/bridge/pairing/00000000-0000-4000-8000-000000000001?cap=${'x'.repeat(43)}`;
+
+    // The URL opened on the Mac reaches the pairing route through the
+    // secondary listener. The unknown capability is intentionally tested only
+    // after the loopback gate, so this would be 403 if the socket were absent.
+    const localApproval = await fetch(`http://127.0.0.1:${port}${pairingPath}`);
+    assert.equal(localApproval.status, 404);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/health`)).status, 403, 'the local socket does not bypass device auth');
+    assert.equal((await fetch(`http://127.0.0.1:${port}/device/${token}/api/health`)).status, 200);
+
+    // The same approval URL is never accepted on the private-interface
+    // listener: its Host is not canonical loopback even when the test process
+    // itself originates from a loopback address.
+    const privateApproval = await fetch(`http://${ipv6Only ? '[::1]' : bindAddress}:${port}${pairingPath}`);
+    assert.equal(privateApproval.status, 403);
+
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await assert.rejects(fetch(`http://127.0.0.1:${port}/`), /fetch failed|ECONNREFUSED|closed/i);
+    await assert.rejects(fetch(`http://${ipv6Only ? '[::1]' : bindAddress}:${port}/`), /fetch failed|ECONNREFUSED|closed/i);
+    server = undefined;
+  } finally {
+    if (server) await new Promise(resolve => server.close(resolve));
+    if (saved.bridgeConfig === undefined) delete process.env.PETROGLYPHS_BRIDGE_CONFIG;
+    else process.env.PETROGLYPHS_BRIDGE_CONFIG = saved.bridgeConfig;
+    if (saved.autoReplyConfig === undefined) delete process.env.PETROGLYPHS_AUTO_REPLY_CONFIG;
+    else process.env.PETROGLYPHS_AUTO_REPLY_CONFIG = saved.autoReplyConfig;
+    if (saved.bindHost === undefined) delete process.env.PETROGLYPHS_BIND_HOST;
+    else process.env.PETROGLYPHS_BIND_HOST = saved.bindHost;
+    if (saved.requireAuth === undefined) delete process.env.PETROGLYPHS_REQUIRE_DEVICE_AUTH;
+    else process.env.PETROGLYPHS_REQUIRE_DEVICE_AUTH = saved.requireAuth;
+    if (saved.legacy === undefined) delete process.env.PETROGLYPHS_LEGACY_SUBMISSIONS;
+    else process.env.PETROGLYPHS_LEGACY_SUBMISSIONS = saved.legacy;
+    await rm(directory, { recursive: true, force: true });
+  }
 });

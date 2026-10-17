@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fork, execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { watch } from 'node:fs';
+import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
@@ -61,6 +62,26 @@ test('extracts only explicit generated, tool, and assistant Markdown image resul
   assert(sanitized.includes('[ordinary link]'));
   assert.equal(resultImageInputs({ type: 'agentMessage', text: '`![code](data:image/png;base64,AA==)`' }).length, 0);
   assert.equal(resultImageInputs({ type: 'agentMessage', text: '[link](https://example.test/a.png)' }).length, 0);
+});
+
+test('malformed image URLs with long escaped runs return promptly', () => {
+  const malformed = '![x](' + '\\'.repeat(40) + 'x';
+  const started = performance.now();
+  assert.equal(stripResultImageSources(malformed), malformed);
+  const elapsed = performance.now() - started;
+  assert(elapsed < 1000, 'malformed image parsing took ' + elapsed.toFixed(1) + 'ms');
+});
+
+test('malformed nested angle and title candidates stay bounded and preserve a later image', () => {
+  const malformedAngle = '![outer](<'.repeat(20_000);
+  const nested = '![nested-valid](https://example.test/nested.png)';
+  const malformedTitle = '![title](url "' + '![nested](url '.repeat(20_000);
+  const kept = '![kept](https://example.test/kept.png)';
+  const started = performance.now();
+  const images = resultImageInputs({ type: 'agentMessage', text: malformedAngle + nested + malformedTitle + kept });
+  const elapsed = performance.now() - started;
+  assert.deepEqual(images.map(image => image.name), ['nested-valid', 'kept']);
+  assert(elapsed < 1000, 'nested malformed image parsing took ' + elapsed.toFixed(1) + 'ms');
 });
 
 test('reads local result images only inside the real chat workspace and rejects symlink escapes', async t => {
@@ -188,6 +209,31 @@ test('a missing source remains retryable after the file becomes available', asyn
   assert.equal((await f.create().attachments(input, f.persist)).attachments[0].unavailableReason, 'image_missing');
   await writeFile(path, png);
   assert.equal((await f.create().attachments(input, f.persist)).attachments[0].availability, 'available');
+});
+
+test('reader spawn failures release slots so a later local read recovers', async t => {
+  const f = await setup(t);
+  const workspace = join(f.root, 'workspace');
+  await mkdir(workspace);
+  const path = join(workspace, 'result.png');
+  await writeFile(path, png);
+  const originalExecPath = process.execPath;
+  process.execPath = join(f.root, 'missing-node');
+  try {
+    for (let index = 0; index < 4; index++) {
+      const failed = await f.create().attachments(request([
+        { type: 'resultImage', source: 'assistant', name: 'Spawn failure ' + index, url: path },
+      ], { cwd: workspace, messageId: 'spawn-failure-' + index }), f.persist);
+      assert.equal(failed.attachments[0].unavailableReason, 'snapshot_unavailable');
+    }
+  } finally {
+    process.execPath = originalExecPath;
+  }
+
+  const recovered = await f.create().attachments(request([
+    { type: 'resultImage', source: 'assistant', name: 'Recovered', url: path },
+  ], { cwd: workspace, messageId: 'spawn-recovered' }), f.persist);
+  assert.equal(recovered.attachments[0].availability, 'available');
 });
 
 test('a blocked external open cannot stall HTTP and times out without retry after restart', { timeout: 15_000 }, async t => {

@@ -41,6 +41,21 @@ interface BetaSignup {
 
 const betaSignups: BetaSignup[] = [];
 
+/**
+ * The browser approval page is deliberately restricted to the canonical
+ * loopback names by bridge-pairing.ts. When the public listener is explicitly
+ * bound to a private interface, keep a second listener on 127.0.0.1 so the
+ * locally opened approval URL still has a socket to reach. Wildcard and
+ * loopback binds already cover that address and must not be duplicated.
+ */
+function needsLoopbackApprovalListener(boundAddress: string): boolean {
+  const host = boundAddress.toLowerCase();
+  return !new Set([
+    '0.0.0.0', '::', '::0', '0:0:0:0:0:0:0:0',
+    '127.0.0.1', '::ffff:127.0.0.1',
+  ]).has(host);
+}
+
 export async function startHttp(port: number): Promise<Server> {
   const app = express();
   const settings = loadBridgeSettings();
@@ -411,12 +426,102 @@ export async function startHttp(port: number): Promise<Server> {
   return new Promise((resolve, reject) => {
     let closeAdvertisement = () => {};
     let closed = false;
-    const onListening = () => {
-      const address = listener.address();
-      const actualPort = typeof address === 'object' && address ? address.port : port;
-      bridgeConnection?.setPort(actualPort);
-      // Ephemeral listeners are used by route tests and should not advertise a
-      // short-lived bridge to nearby devices.
+    const bindHost = process.env.PETROGLYPHS_BIND_HOST?.trim() || undefined;
+    let listener!: Server;
+    let approvalListener: Server | undefined;
+    let originalClose!: Server['close'];
+    let closeStarted = false;
+    let closeFinished = false;
+    let closeError: Error | undefined;
+    let closePromise: Promise<void> | undefined;
+    const closeCallbacks: Array<(error?: Error) => void> = [];
+    let startup: 'pending' | 'resolved' | 'rejected' = 'pending';
+
+    const closeServices = () => {
+      if (closed) return;
+      closed = true;
+      closeAdvertisement();
+      bridgePairings?.close();
+      remoteHosts.close();
+    };
+
+    // A public server returned by startHttp owns the approval listener too.
+    // Keep server.close's callback semantics: callers can await one callback
+    // and know that both sockets and all bridge services are closed.
+    const closeServers = (): Promise<void> => {
+      if (closePromise) return closePromise;
+      closeStarted = true;
+      const servers = [approvalListener, listener].filter((server): server is Server => Boolean(server));
+      closePromise = new Promise<void>(resolveClose => {
+        let remaining = servers.length;
+        let finished = false;
+        const done = (error?: Error) => {
+          if (error && !closeError) closeError = error;
+          if (--remaining > 0 || finished) return;
+          finished = true;
+          closeFinished = true;
+          closeServices();
+          const callbacks = closeCallbacks.splice(0);
+          for (const callback of callbacks) {
+            try { callback(closeError); } catch { /* Preserve close completion for other callers. */ }
+          }
+          resolveClose();
+        };
+        if (!servers.length) { done(); return; }
+        for (const server of servers) {
+          try {
+            if (!server.listening) { done(); continue; }
+            // The returned primary server gets a composite close method after
+            // the secondary listener is ready; always call the original method
+            // from inside the composite implementation.
+            if (server === listener) originalClose(done);
+            else server.close(done);
+          } catch (error) {
+            done(error instanceof Error ? error : new Error(String(error)));
+          }
+        }
+      });
+      return closePromise;
+    };
+
+    const requestClose = (callback?: (error?: Error) => void) => {
+      if (callback) {
+        if (closeFinished) process.nextTick(() => callback(closeError));
+        else closeCallbacks.push(callback);
+      }
+      void closeServers();
+      return listener;
+    };
+
+    const failStartup = (error: Error) => {
+      if (startup === 'pending') {
+        startup = 'rejected';
+        // Do not hand a failed start back to callers until both sockets and
+        // the bridge services have had a chance to shut down.
+        void closeServers().then(() => reject(error));
+        return;
+      }
+      void closeServers();
+    };
+
+    const onSecondaryClose = () => {
+      if (!closeStarted) failStartup(new Error('The loopback pairing listener closed unexpectedly.'));
+    };
+    const onSecondaryError = (error: Error) => {
+      if (startup === 'pending') failStartup(error);
+      else void closeServers();
+    };
+    const onPrimaryClose = () => {
+      if (startup === 'pending') failStartup(new Error('The HTTP listener closed before startup completed.'));
+      closeServices();
+      if (!closeStarted && approvalListener) void closeServers();
+    };
+    const onPrimaryError = (error: Error) => {
+      if (startup === 'pending') failStartup(error);
+      else void closeServers();
+    };
+
+    const announce = (actualPort: number) => {
       if (bridgeConnection && port !== 0) void advertiseBridge(bridgeConnection).then(close => {
         if (closed) close(); else closeAdvertisement = close;
       }).catch(() => { console.error('[petroglyphs] Bonjour discovery is unavailable. Tailscale discovery remains enabled.'); });
@@ -425,17 +530,53 @@ export async function startHttp(port: number): Promise<Server> {
       console.error(`[petroglyphs]   iPad API:  POST http://localhost:${actualPort}/api/submit`);
       console.error(`[petroglyphs]   Health:    GET  http://localhost:${actualPort}/api/health`);
       console.error(`[petroglyphs]   MCP HTTP:  POST http://localhost:${actualPort}${settings ? "/device/<token>" : ""}/mcp`);
+    };
+
+    const onListening = () => {
+      const address = listener.address();
+      if (typeof address !== 'object' || !address || !address.port) {
+        failStartup(new Error('The HTTP listener did not report a usable port.'));
+        return;
+      }
+      const actualPort = address.port;
+      bridgeConnection?.setPort(actualPort);
+      // Use the resolved socket address: localhost may resolve to ::1, which
+      // does not accept the canonical 127.0.0.1 approval URL.
+      if (bridgePairings && needsLoopbackApprovalListener(address.address)) {
+        try {
+          approvalListener = app.listen(actualPort, '127.0.0.1', () => {
+            if (startup !== 'pending' || closeStarted) {
+              // A primary-listener failure can race this callback. Do not
+              // leave a late secondary socket behind after startup failed.
+              try { approvalListener?.close(); } catch { /* It may already be closed. */ }
+              return;
+            }
+            // Install the composite close method only after both sockets exist.
+            listener.close = requestClose as Server['close'];
+            announce(actualPort);
+            startup = 'resolved';
+            resolve(listener);
+          });
+          approvalListener.once('close', onSecondaryClose);
+          approvalListener.once('error', onSecondaryError);
+        } catch (error) {
+          failStartup(error instanceof Error ? error : new Error(String(error)));
+        }
+        return;
+      }
+      if (startup !== 'pending' || closeStarted) return;
+      announce(actualPort);
+      startup = 'resolved';
       resolve(listener);
     };
-    const bindHost = process.env.PETROGLYPHS_BIND_HOST;
-    const listener = bindHost ? app.listen(port, bindHost, onListening) : app.listen(port, onListening);
-    const closeServices = () => {
-      closed = true;
-      closeAdvertisement();
-      bridgePairings?.close();
-      remoteHosts.close();
-    };
-    listener.once('close', closeServices);
-    listener.once('error', error => { closeServices(); reject(error); });
+
+    try {
+      listener = bindHost ? app.listen(port, bindHost, onListening) : app.listen(port, onListening);
+      originalClose = listener.close.bind(listener);
+      listener.once('close', onPrimaryClose);
+      listener.once('error', onPrimaryError);
+    } catch (error) {
+      failStartup(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }

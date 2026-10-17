@@ -76,9 +76,166 @@ function withoutCode(text: string): string {
   return visible.replace(/(^|[^\\])(`+)([\s\S]*?)\2/g, (match, prefix: string) => prefix + ' '.repeat(match.length - prefix.length));
 }
 
-function markdownImageMatches(text: string): RegExpMatchArray[] {
-  const pattern = /(?<!\\)!\[([^\]\n]*)\]\(\s*(<[^>\n]+>|(?:\\.|[^)\s])+)(?:\s+(?:"[^"\n]*"|'[^'\n]*'))?\s*\)/gm;
-  return [...withoutCode(text).matchAll(pattern)];
+type MarkdownImageMatch = [string, string, string] & { index: number };
+
+type MarkdownScanIndex = {
+  nextOpener: Int32Array;
+  nextAltStop: Int32Array;
+  nextAngleStop: Int32Array;
+  nextDoubleQuoteStop: Int32Array;
+  nextSingleQuoteStop: Int32Array;
+  nextNonWhitespace: Int32Array;
+  // A non-negative value is the first bare-URL stop. A negative value
+  // encodes the position of a malformed backslash escape as -(position + 1).
+  bareResult: Int32Array;
+};
+
+const markdownWhitespace = /\s/;
+
+function isMarkdownWhitespace(value: string | undefined): boolean {
+  return value !== undefined && markdownWhitespace.test(value);
+}
+
+function isMarkdownNewline(value: string | undefined): boolean {
+  return value === '\n';
+}
+
+function isMarkdownDotLineTerminator(value: string | undefined): boolean {
+  return value === '\n' || value === '\r' || value === '\u2028' || value === '\u2029';
+}
+
+function markdownScanIndex(text: string): MarkdownScanIndex {
+  const length = text.length;
+  const nextOpener = new Int32Array(length + 1);
+  const nextAltStop = new Int32Array(length + 1);
+  const nextAngleStop = new Int32Array(length + 1);
+  const nextDoubleQuoteStop = new Int32Array(length + 1);
+  const nextSingleQuoteStop = new Int32Array(length + 1);
+  const nextNonWhitespace = new Int32Array(length + 1);
+  const bareResult = new Int32Array(length + 1);
+  nextOpener.fill(length);
+  nextAltStop.fill(length);
+  nextAngleStop.fill(length);
+  nextDoubleQuoteStop.fill(length);
+  nextSingleQuoteStop.fill(length);
+  nextNonWhitespace.fill(length);
+  bareResult.fill(length);
+
+  let nextBracket = length;
+  let nextNewline = length;
+  let nextGreater = length;
+  let nextDoubleQuote = length;
+  let nextSingleQuote = length;
+  for (let position = length - 1; position >= 0; position--) {
+    const character = text[position];
+    if (character === ']') nextBracket = position;
+    if (character === '\n') nextNewline = position;
+    if (character === '>') nextGreater = position;
+    if (character === '"') nextDoubleQuote = position;
+    if (character === "'") nextSingleQuote = position;
+
+    nextOpener[position] = character === '!' && text[position + 1] === '['
+      ? position : nextOpener[position + 1];
+    nextAltStop[position] = Math.min(nextBracket, nextNewline);
+    nextAngleStop[position] = Math.min(nextGreater, nextNewline);
+    nextDoubleQuoteStop[position] = Math.min(nextDoubleQuote, nextNewline);
+    nextSingleQuoteStop[position] = Math.min(nextSingleQuote, nextNewline);
+    nextNonWhitespace[position] = isMarkdownWhitespace(character)
+      ? nextNonWhitespace[position + 1] : position;
+
+    if (character === ')' || isMarkdownWhitespace(character)) {
+      bareResult[position] = position;
+    } else if (character === '\\') {
+      bareResult[position] = position + 1 >= length || isMarkdownDotLineTerminator(text[position + 1])
+        ? -(position + 1) : bareResult[position + 2];
+    } else {
+      bareResult[position] = bareResult[position + 1];
+    }
+  }
+
+  return { nextOpener, nextAltStop, nextAngleStop, nextDoubleQuoteStop,
+    nextSingleQuoteStop, nextNonWhitespace, bareResult };
+}
+
+function imageMatchFailure(index: MarkdownScanIndex, position: number, nestedSearchStart: number): { resume: number } {
+  // Resume at a precomputed later opener so a valid image inside a malformed
+  // outer image is still discovered without rescanning the same suffix.
+  const nested = index.nextOpener[nestedSearchStart] ?? index.nextOpener[index.nextOpener.length - 1];
+  if (nested < index.nextOpener.length - 1) return { resume: nested };
+  const length = index.nextOpener.length - 1;
+  return { resume: position >= length ? length : position + 1 };
+}
+
+function parseMarkdownImage(text: string, index: MarkdownScanIndex, start: number): MarkdownImageMatch | { resume: number } {
+  let position = start + 2;
+  const altStart = position;
+  position = index.nextAltStop[position];
+  if (position >= text.length || isMarkdownNewline(text[position])) return imageMatchFailure(index, position, start + 2);
+  const altEnd = position;
+  if (text[position + 1] !== '(') return imageMatchFailure(index, position, start + 2);
+
+  position += 2;
+  position = index.nextNonWhitespace[position];
+  const urlStart = position;
+  let urlEnd = position;
+  if (text[position] === '<') {
+    position++;
+    const angleStart = position;
+    position = index.nextAngleStop[position];
+    if (position >= text.length || isMarkdownNewline(text[position]) || position === angleStart) {
+      return imageMatchFailure(index, position, start + 2);
+    }
+    position++;
+    urlEnd = position;
+  } else {
+    const result = index.bareResult[position];
+    if (result < 0) return imageMatchFailure(index, -result - 1, start + 2);
+    if (result === position) return imageMatchFailure(index, position, start + 2);
+    position = result;
+    urlEnd = position;
+  }
+
+  if (isMarkdownWhitespace(text[position])) {
+    position = index.nextNonWhitespace[position];
+    const quote = text[position];
+    if (quote === '"' || quote === "'") {
+      position++;
+      position = quote === '"' ? index.nextDoubleQuoteStop[position] : index.nextSingleQuoteStop[position];
+      if (position >= text.length || isMarkdownNewline(text[position])) return imageMatchFailure(index, position, start + 2);
+      position++;
+    }
+  }
+  position = index.nextNonWhitespace[position];
+  if (text[position] !== ')') return imageMatchFailure(index, position, start + 2);
+  position++;
+
+  const match = [text.slice(start, position), text.slice(altStart, altEnd), text.slice(urlStart, urlEnd)] as MarkdownImageMatch;
+  match.index = start;
+  return match;
+}
+
+function markdownImageMatches(text: string): MarkdownImageMatch[] {
+  const visible = withoutCode(text);
+  if (!visible.includes('![')) return [];
+  const index = markdownScanIndex(visible);
+  const matches: MarkdownImageMatch[] = [];
+  let cursor = 0;
+  while (cursor < visible.length) {
+    const start = visible.indexOf('![', cursor);
+    if (start < 0) break;
+    if (start > 0 && visible[start - 1] === '\\') {
+      cursor = start + 2;
+      continue;
+    }
+    const parsed = parseMarkdownImage(visible, index, start);
+    if ('index' in parsed) {
+      matches.push(parsed);
+      cursor = start + parsed[0].length;
+    } else {
+      cursor = Math.max(start + 2, parsed.resume);
+    }
+  }
+  return matches;
 }
 
 export function stripResultImageSources(text: string): string {
@@ -357,10 +514,25 @@ function readIsolatedImage(input: LocalImageRequest, timeoutMs: number): Promise
   // pool. A child still counts against this bound until the OS reports its exit.
   if (activeImageReaders >= 4) return Promise.reject(new ResultImageFailure('snapshot_unavailable'));
   return new Promise((resolve, reject) => {
-    const child = fork(new URL(import.meta.url), [readerArgument], {
-      stdio: ['ignore', 'ignore', 'ignore', 'ipc'], serialization: 'advanced',
-    });
+    let child: ReturnType<typeof fork>;
+    try {
+      child = fork(new URL(import.meta.url), [readerArgument], {
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'], serialization: 'advanced',
+      });
+    } catch {
+      // A synchronous spawn failure has no child that can later emit exit or
+      // close, and therefore does not consume a reader slot.
+      reject(new ResultImageFailure('snapshot_unavailable'));
+      return;
+    }
     activeImageReaders++;
+    let spawned = false;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      activeImageReaders--;
+    };
     let settled = false;
     const timer = setTimeout(() => finish(new ResultImageTimeout()), timeoutMs);
     const finish = (error?: Error, image?: ImageBytes) => {
@@ -372,11 +544,24 @@ function readIsolatedImage(input: LocalImageRequest, timeoutMs: number): Promise
       child.unref();
       if (error) reject(error); else resolve(image!);
     };
+    child.once('spawn', () => { spawned = true; });
     child.once('exit', () => {
-      activeImageReaders--;
+      release();
       finish(new ResultImageFailure('snapshot_unavailable'));
     });
-    child.once('error', () => finish(new ResultImageFailure('snapshot_unavailable')));
+    child.once('close', () => {
+      // Spawn failures emit error + close without exit. A live reader that
+      // timed out only releases here if its process has actually terminated.
+      release();
+      finish(new ResultImageFailure('snapshot_unavailable'));
+    });
+    child.once('error', () => {
+      // Before spawn, error is a definite failure (typically ENOENT). After
+      // spawn, keep the slot until exit/close because the child may still be
+      // blocked in the OS read.
+      if (!spawned) release();
+      finish(new ResultImageFailure('snapshot_unavailable'));
+    });
     child.once('message', value => {
       const result = value as { bytes?: unknown; mimeType?: unknown; reason?: unknown } | null;
       if (result && Buffer.isBuffer(result.bytes) && result.bytes.length <= MAX_IMAGE_BYTES
