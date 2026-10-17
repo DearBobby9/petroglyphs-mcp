@@ -11,6 +11,7 @@ import { installConversationRoutes } from './codex-conversation-routes.js';
 import { installProjectRoutes } from './codex-project-routes.js';
 import { installModelRoutes } from './codex-model-routes.js';
 import { installDiagnosticsRoutes } from './codex-diagnostics.js';
+import { installControlRoutes } from './codex-execution-controls.js';
 import { ConversationError } from './codex-message-input.js';
 import { validProjectId } from './codex-projects-catalog.js';
 import { BridgeConnection, installBridgeIdentityRoute } from './bridge-connection.js';
@@ -69,6 +70,7 @@ export async function startHttp(port: number): Promise<Server> {
   installProjectRoutes(app, remoteHosts.projectChats);
   installModelRoutes(app, remoteHosts.models);
   installDiagnosticsRoutes(app, remoteHosts.diagnostics);
+  installControlRoutes(app, remoteHosts.controls);
 
   // ── Landing page ──
 

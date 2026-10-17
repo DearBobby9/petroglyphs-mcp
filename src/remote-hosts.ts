@@ -18,6 +18,7 @@ import { BUNDLED_CODEX_PATH, CodexNativeAppServer } from './codex-native-app-ser
 import { CodexNativeCreator, readNativeProjectMembership } from './codex-native-creator.js';
 import { ConversationError } from './codex-message-input.js';
 import { CodexDiagnostics, runtimeDiagnosticsReader } from './codex-diagnostics.js';
+import { CodexExecutionControls } from './codex-execution-controls.js';
 
 const hostIdPattern = /^remote-control:env_[A-Za-z0-9_-]{1,128}$/;
 const maxResponseBytes = 4 * 1024 * 1024;
@@ -95,6 +96,7 @@ interface DesktopRuntime {
   projectChats: CodexProjectChats;
   models: ModelAccess;
   diagnostics: CodexDiagnostics;
+  controls: CodexExecutionControls;
 }
 
 function isPrivateHttpHost(hostname: string): boolean {
@@ -219,6 +221,7 @@ export class RemoteHosts {
         catalog,
         projectChats,
         diagnostics: new CodexDiagnostics({ runtime: runtimeDiagnostics, connect, requireTarget, catalog: models }),
+        controls: new CodexExecutionControls({ runtime: runtimeDiagnostics, connect, requireTarget }),
         models: { catalog: models, readSettings: async (hostId, threadId) => {
           await requireTarget(hostId, threadId);
           const client = await connect();
@@ -375,6 +378,7 @@ export class RemoteHosts {
   get projectChats(): CodexProjectChats | undefined { return this.desktop?.projectChats; }
   get models(): ModelAccess | undefined { return this.desktop?.models; }
   get diagnostics(): CodexDiagnostics | undefined { return this.desktop?.diagnostics; }
+  get controls(): CodexExecutionControls | undefined { return this.desktop?.controls; }
 
   close(): void { this.desktop?.submissions.close(); this.desktop?.conversations.close(); this.desktop?.projectChats.close(); }
 }

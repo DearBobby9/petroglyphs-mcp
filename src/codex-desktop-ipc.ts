@@ -13,13 +13,14 @@ const methodVersions = {
   'thread-follower-read-model-settings': 1,
   'thread-follower-load-complete-history': 1,
   'thread-follower-start-turn': 2,
+  'thread-follower-interrupt-turn': 4,
 } as const;
 type RequestMethod = keyof typeof methodVersions;
 type JsonObject = Record<string, unknown>;
 type Delivery = 'not-sent' | 'unknown';
 export type DesktopIpcErrorCode = 'desktop_unavailable' | 'owner_unavailable' | 'follower_timeout'
   | 'request_timeout' | 'connection_closed' | 'protocol_mismatch' | 'desktop_rejected' | 'invalid_receipt'
-  | 'invalid_model_selection' | 'model_settings_unavailable';
+  | 'invalid_model_selection' | 'model_settings_unavailable' | 'capability_unverified';
 
 export class CodexDesktopIpcError extends Error {
   readonly outcome: 'not_sent' | 'unknown';
@@ -71,6 +72,8 @@ export interface ImageTurn {
   selection?: CodexModelSelection;
 }
 export interface ImageTurnReceipt { turnId: string; clientUserMessageId: string }
+export interface DesktopInterruptTarget { hostId: string; threadId: string; turnId: string }
+export interface DesktopInterruptReceipt { interruptedTurnId: string | null }
 export interface MessageTurn {
   hostId: string;
   threadId: string;
@@ -275,7 +278,7 @@ export class CodexDesktopIpc {
   private request(method: RequestMethod, params: JsonObject, hostId?: string, owner?: string): Promise<Response> {
     if (!Object.hasOwn(methodVersions, method)) return Promise.reject(new CodexDesktopIpcError('This desktop operation is not available.', 400));
     const requestId = randomUUID();
-    const mutating = method === 'thread-follower-start-turn';
+    const mutating = method === 'thread-follower-start-turn' || method === 'thread-follower-interrupt-turn';
     return new Promise((resolve, reject) => {
       const pending: Pending = { method, mutating, written: false, resolve, reject,
         timer: setTimeout(() => {
@@ -456,6 +459,50 @@ export class CodexDesktopIpc {
     const entry = this.retain(hostId, threadId);
     try { return await this.refresh(entry); }
     finally { this.release(entry); }
+  }
+
+  /** The inspected local v4 handler returns null before any cleanup when expectedTurnId is absent. */
+  async verifyLocalInterrupt(snapshot: DesktopSnapshot): Promise<boolean> {
+    if (snapshot.hostId !== 'local' || !isThreadId(snapshot.threadId) || !snapshot.ownerClientId) return false;
+    const state = snapshot.conversationState;
+    const turns = Array.isArray(state.turns) ? [...state.turns] : [];
+    if (object(state.turnHistory) && object(state.turnHistory.history) && object(state.turnHistory.history.entitiesByKey)) {
+      turns.push(...Object.values(state.turnHistory.history.entitiesByKey));
+    }
+    const knownIds = new Set(turns.filter(object).flatMap(turn => [turn.id, turn.turnId]));
+    let probeTurnId: string;
+    do { probeTurnId = randomUUID(); } while (knownIds.has(probeTurnId));
+    try {
+      const response = await this.request('thread-follower-interrupt-turn', {
+        conversationId: snapshot.threadId, expectedTurnId: probeTurnId, mode: 'system',
+      }, snapshot.hostId, snapshot.ownerClientId);
+      return response.handledByClientId === snapshot.ownerClientId && object(response.result)
+        && response.result.ok === true && response.result.interruptedTurnId === null;
+    } catch { return false; }
+  }
+
+  /** Verify this owner, then require Desktop to reject a stale turn at execution time. */
+  async interruptTurn(input: DesktopInterruptTarget): Promise<DesktopInterruptReceipt> {
+    const { hostId, threadId, turnId } = input;
+    target(hostId, threadId);
+    if (!isThreadId(turnId)) throw new CodexDesktopIpcError('A valid target turn is required.', 400);
+    if (hostId !== 'local') throw new CodexDesktopIpcError('Stop capability is not verified for this host. Use the original chat in Desktop.',
+      409, 'not-sent', 'capability_unverified');
+    const entry = this.retain(hostId, threadId);
+    try {
+      const snapshot = await this.refresh(entry);
+      if (!await this.verifyLocalInterrupt(snapshot)) throw new CodexDesktopIpcError('Stop capability is not verified for this chat owner. Use Desktop.',
+        409, 'not-sent', 'capability_unverified');
+      const response = await this.request('thread-follower-interrupt-turn', {
+        conversationId: threadId, expectedTurnId: turnId, mode: 'user-stop',
+      }, hostId, snapshot.ownerClientId);
+      if (response.handledByClientId !== snapshot.ownerClientId || !object(response.result) || response.result.ok !== true
+        || (response.result.interruptedTurnId !== null && response.result.interruptedTurnId !== turnId)) {
+        throw new CodexDesktopIpcError('Codex did not confirm stopping the selected turn. Check that chat in Desktop.',
+          503, 'unknown', 'invalid_receipt');
+      }
+      return { interruptedTurnId: response.result.interruptedTurnId as string | null };
+    } finally { this.release(entry); }
   }
 
   async startImageTurn(input: ImageTurn): Promise<ImageTurnReceipt> {

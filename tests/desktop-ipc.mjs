@@ -71,7 +71,8 @@ async function fixture(t, custom = {}) {
           assert.equal(request.sourceClientId, clientId);
           assert.equal(request.hostId, selectedHost);
           assert.equal(request.params.conversationId, thread);
-          assert.equal(request.version, request.method === 'thread-follower-start-turn' ? 3 : 2);
+          assert.equal(request.version, request.method === 'thread-follower-start-turn' ? 3
+            : request.method === 'thread-follower-interrupt-turn' ? 5 : 2);
           if (custom.request && await custom.request(request, socket, controls)) return;
           if (request.method === 'thread-follower-read-model-settings') {
             reply(socket, request, { settings: { model: 'gpt-6-astra', reasoningEffort: 'max', resumeState: 'resumed', privateDiagnostic: 'PRIVATE_SECRET' } });
@@ -150,6 +151,76 @@ test('an incompatible Desktop stream version reports protocol mismatch rather th
   assert.equal(result.code, 'protocol_mismatch');
   assert.equal(result.outcome, 'not_sent');
   stop();
+});
+
+test('stop binds the host, owner and exact turn, including a stale request delivered after a new turn starts', async t => {
+  const nextTurn = '00000000-0000-7000-8000-000000000006';
+  let activeTurn = turn;
+  const f = await fixture(t, { hostId: 'local', request(request, socket, c) {
+    if (request.method !== 'thread-follower-interrupt-turn') return false;
+    assert.equal(request.targetClientId, owner);
+    if (request.params.mode === 'system') {
+      assert.notEqual(request.params.expectedTurnId, turn);
+      assert.notEqual(request.params.expectedTurnId, nextTurn);
+      c.reply(socket, request, { ok: true, interruptedTurnId: null });
+      return true;
+    }
+    assert.deepEqual(request.params, { conversationId: thread, expectedTurnId: turn, mode: 'user-stop' });
+    const interruptedTurnId = activeTurn === request.params.expectedTurnId ? activeTurn : null;
+    if (interruptedTurnId) activeTurn = nextTurn;
+    c.reply(socket, request, { ok: true, interruptedTurnId });
+    return true;
+  } });
+  const ipc = await f.connect();
+  assert.deepEqual(await ipc.interruptTurn({ hostId: 'local', threadId: thread, turnId: turn }), { interruptedTurnId: turn });
+  assert.deepEqual(await ipc.interruptTurn({ hostId: 'local', threadId: thread, turnId: turn }), { interruptedTurnId: null });
+  assert.equal(activeTurn, nextTurn);
+  assert.equal(f.requests.filter(request => request.method === 'thread-follower-interrupt-turn' && request.params.mode === 'user-stop').length, 2);
+});
+
+test('interrupt capability is target scoped and fails closed for remote, incompatible or changed owners', async t => {
+  const remote = await fixture(t);
+  const remoteIpc = await remote.connect();
+  assert.equal(await remoteIpc.verifyLocalInterrupt({ hostId: host, threadId: thread, ownerClientId: owner, conversationState: remote.state }), false);
+  await assert.rejects(remoteIpc.interruptTurn({ hostId: host, threadId: thread, turnId: turn }), error => error.code === 'capability_unverified');
+  assert.equal(remote.requests.filter(request => request.method === 'thread-follower-interrupt-turn').length, 0);
+  for (const scenario of ['version-mismatch', 'owner-changed']) {
+    await t.test(scenario, async t => {
+      const f = await fixture(t, { hostId: 'local', request(request, socket, c) {
+        if (request.method !== 'thread-follower-interrupt-turn') return false;
+        assert.equal(request.params.mode, 'system', 'an unverified owner must never receive the real stop');
+        c.send(socket, { type: 'response', requestId: request.requestId, method: request.method,
+          ...(scenario === 'version-mismatch' ? { resultType: 'error', error: 'request-version-mismatch' }
+            : { resultType: 'success', handledByClientId: 'different-owner', result: { ok: true, interruptedTurnId: null } }) });
+        return true;
+      } });
+      const ipc = await f.connect();
+      await assert.rejects(ipc.interruptTurn({ hostId: 'local', threadId: thread, turnId: turn }), error =>
+        error.code === 'capability_unverified' && error.outcome === 'not_sent');
+      assert.equal(f.requests.filter(request => request.method === 'thread-follower-interrupt-turn').length, 1);
+    });
+  }
+});
+
+test('stop timeout and a receipt for a different turn remain unknown without replay or approval side effects', async t => {
+  for (const scenario of ['timeout', 'mismatched-turn']) {
+    await t.test(scenario, async t => {
+      const f = await fixture(t, { hostId: 'local', request(request, socket, c) {
+        if (request.method !== 'thread-follower-interrupt-turn') return false;
+        if (request.params.mode === 'system') { c.reply(socket, request, { ok: true, interruptedTurnId: null }); return true; }
+        if (scenario === 'mismatched-turn') c.reply(socket, request, { ok: true, interruptedTurnId: submission });
+        return true;
+      } });
+      const ipc = await f.connect({ timeoutMs: 100 });
+      await assert.rejects(ipc.interruptTurn({ hostId: 'local', threadId: thread, turnId: turn }), error => {
+        assert.equal(error.outcome, 'unknown');
+        assert.equal(error.code, scenario === 'timeout' ? 'request_timeout' : 'invalid_receipt');
+        return true;
+      });
+      assert.equal(f.requests.filter(request => request.method === 'thread-follower-interrupt-turn' && request.params.mode === 'user-stop').length, 1);
+      assert(!f.requests.some(request => /approval|user-input|settings/.test(request.method)));
+    });
+  }
 });
 
 test('startImageTurn hydrates a fresh snapshot and sends the exact PNG to the fixed remote chat with inherited settings', async t => {
