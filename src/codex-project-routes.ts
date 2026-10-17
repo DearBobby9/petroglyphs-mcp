@@ -40,4 +40,12 @@ export function installProjectRoutes(app: Express, service?: CodexProjectChats):
       res.json(await service!.status(hostId, projectId, String(req.params.id)));
     } catch (error) { failure(res, error); }
   });
+
+  app.post('/api/codex/chats/:id/retry', async (req, res) => {
+    if (!authorize(res)) return;
+    try {
+      const result = await service!.retry(String(req.params.id), req.body);
+      res.status(result.duplicate ? 200 : 202).json(result.receipt);
+    } catch (error) { failure(res, error); }
+  });
 }

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { CodexRoutingError, isThreadId } from './codex-threads.js';
+import { modelSelectionSchema } from './codex-model-selection.js';
+import type { CodexModelSelection } from './codex-desktop-ipc.js';
 
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
@@ -12,7 +14,10 @@ export class ConversationError extends CodexRoutingError {
 }
 
 export interface MessageAttachmentInput { id: string; name: string; mimeType: 'image/png' | 'image/jpeg'; dataBase64: string }
-export interface MessageInput { id: string; hostId: string; threadId: string; text: string; attachments: MessageAttachmentInput[] }
+export interface MessageInput {
+  id: string; hostId: string; threadId: string; text: string; attachments: MessageAttachmentInput[];
+  selection?: CodexModelSelection;
+}
 const uuid = z.string().refine(isThreadId);
 const inputSchema = z.object({
   id: uuid, hostId: z.string().refine(isCodexHost), threadId: uuid, text: z.string().max(20_000),
@@ -20,6 +25,7 @@ const inputSchema = z.object({
     .refine(name => !/[\x00-\x1f\x7f/\\]/.test(name)),
   mimeType: z.enum(['image/png', 'image/jpeg']), dataBase64: z.string().max(Math.ceil(MAX_IMAGE_BYTES / 3) * 4),
   }).strict()).max(4),
+  selection: modelSelectionSchema.optional(),
 }).strict();
 
 export function imageBytes(base64: string, mimeType: string): Buffer {
@@ -57,5 +63,6 @@ export function parseMessageInput(value: unknown): MessageInput {
 export function messageFingerprint(input: MessageInput): string {
   return createHash('sha256').update(JSON.stringify({ id: input.id, hostId: input.hostId, threadId: input.threadId,
     text: input.text, attachments: input.attachments.map(attachment => ({ ...attachment,
-      dataBase64: createHash('sha256').update(Buffer.from(attachment.dataBase64, 'base64')).digest('hex') })) })).digest('hex');
+      dataBase64: createHash('sha256').update(Buffer.from(attachment.dataBase64, 'base64')).digest('hex') })),
+    ...(input.selection ? { selection: input.selection } : {}) })).digest('hex');
 }

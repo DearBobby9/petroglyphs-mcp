@@ -6,12 +6,16 @@ import { CodexThreads, isThreadId, type ThreadPage, type ThreadQuery } from './c
 import type { Combo, StrokeMetadata } from './types.js';
 import type { SubmissionSummary } from './codex-replies.js';
 import { CodexDesktopCatalog } from './codex-desktop-catalog.js';
-import { CodexDesktopIpc } from './codex-desktop-ipc.js';
+import { CodexDesktopIpc, type CodexModelSelection } from './codex-desktop-ipc.js';
+import { CodexModelCatalog, CodexModelCatalogError } from './codex-model-catalog.js';
+import type { ModelAccess } from './codex-model-routes.js';
 import { DesktopSubmissions } from './codex-desktop-submissions.js';
 import { CodexConversations } from './codex-conversations.js';
 import { CodexCompanionCreator } from './codex-companion-creator.js';
 import { CodexProjectsCatalog } from './codex-projects-catalog.js';
 import { CodexProjectChats } from './codex-project-chats.js';
+import { BUNDLED_CODEX_PATH, CodexNativeAppServer } from './codex-native-app-server.js';
+import { CodexNativeCreator, readNativeProjectMembership } from './codex-native-creator.js';
 import { ConversationError } from './codex-message-input.js';
 
 const hostIdPattern = /^remote-control:env_[A-Za-z0-9_-]{1,128}$/;
@@ -88,6 +92,7 @@ interface DesktopRuntime {
   submissions: DesktopSubmissions;
   conversations: CodexConversations;
   projectChats: CodexProjectChats;
+  models: ModelAccess;
 }
 
 function isPrivateHttpHost(hostname: string): boolean {
@@ -180,18 +185,42 @@ export class RemoteHosts {
         if (!host?.configured) throw new ConversationError('Enable the selected connection in Codex Desktop.', 404, 'connection_unavailable');
         if (!host.available) throw new ConversationError('Codex Desktop is still loading this connection. Try again after it syncs.', 503, 'connection_unavailable');
       };
-      const projects = new CodexProjectsCatalog({ env, requireHost });
+      const nativeCodexPath = env.PETROGLYPHS_NATIVE_CODEX_PATH ?? BUNDLED_CODEX_PATH;
+      const connectNative = () => CodexNativeAppServer.connect({ codexPath: nativeCodexPath, env });
+      const projects = new CodexProjectsCatalog({ env, requireHost, nativeProjectThreads: async identity => {
+        const client = await connectNative();
+        try { return await readNativeProjectMembership(client, identity); }
+        finally { await client.close(); }
+      } });
+      const models = await CodexModelCatalog.fromEnvironment({ codexPath: env.PETROGLYPHS_MODEL_CODEX_PATH ?? settings.codexPath, env });
+      const requireSelection = async (hostId: string, selection: CodexModelSelection, hasImages: boolean) => {
+        try { await models.requireSelection(hostId, { ...selection, hasImages }); }
+        catch (error) {
+          if (error instanceof CodexModelCatalogError) throw new ConversationError(error.message, error.status, error.code);
+          throw new ConversationError('The model catalogue is temporarily unavailable.', 503, 'catalogue_unavailable');
+        }
+      };
       const projectChats = new CodexProjectChats({ dataDir: join(settings.dataDir, 'project-chats'), catalog: projects,
+        requireSelection,
+        localExecutor: new CodexNativeCreator({ dataDir: join(settings.dataDir, 'project-chats', 'native'), codexPath: nativeCodexPath,
+          env, catalog: projects, connectNative, connectDesktop: connect }),
         executor: new CodexCompanionCreator({ helperThreadId: env.PETROGLYPHS_CODEX_CREATOR_THREAD_ID, connect, catalog: projects }) });
+      const requireTarget = async (hostId: string, threadId: string) => {
+        if (projectChats.hasThread(hostId, threadId)) { await requireHost(hostId); return; }
+        return hostId === 'local' ? localThreads.requireThread(threadId) : catalog.requireThread(hostId, threadId);
+      };
       desktop = {
         catalog,
         projectChats,
+        models: { catalog: models, readSettings: async (hostId, threadId) => {
+          await requireTarget(hostId, threadId);
+          const client = await connect();
+          try { return await client.readSettings(hostId, threadId); }
+          finally { client.close(); }
+        } },
         conversations: new CodexConversations({ dataDir: join(settings.dataDir, 'conversations'), legacyDataDir: settings.dataDir,
           connect, verifiedFirstMessage: (hostId, threadId) => projectChats.verifiedFirstMessage(hostId, threadId),
-          requireTarget: async (hostId, threadId) => {
-            if (projectChats.hasThread(hostId, threadId)) { await requireHost(hostId); return; }
-            return hostId === 'local' ? localThreads.requireThread(threadId) : catalog.requireThread(hostId, threadId);
-          } }),
+          requireTarget, requireSelection }),
         submissions: new DesktopSubmissions({
           dataDir: join(settings.dataDir, 'remote-desktop'),
           // Desktop snapshots include image history. Match the native router's
@@ -336,6 +365,7 @@ export class RemoteHosts {
 
   get conversations(): CodexConversations | undefined { return this.desktop?.conversations; }
   get projectChats(): CodexProjectChats | undefined { return this.desktop?.projectChats; }
+  get models(): ModelAccess | undefined { return this.desktop?.models; }
 
   close(): void { this.desktop?.submissions.close(); this.desktop?.conversations.close(); this.desktop?.projectChats.close(); }
 }

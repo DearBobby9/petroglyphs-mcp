@@ -9,6 +9,7 @@ import { CodexRoutingError, isThreadId } from './codex-threads.js';
 import { RemoteHostError, RemoteHosts } from './remote-hosts.js';
 import { installConversationRoutes } from './codex-conversation-routes.js';
 import { installProjectRoutes } from './codex-project-routes.js';
+import { installModelRoutes } from './codex-model-routes.js';
 import { ConversationError } from './codex-message-input.js';
 import { validProjectId } from './codex-projects-catalog.js';
 import { BridgeConnection, installBridgeIdentityRoute } from './bridge-connection.js';
@@ -65,6 +66,7 @@ export async function startHttp(port: number): Promise<Server> {
   app.use('/assets', express.static(join(__dirname, '..', 'public')));
   installConversationRoutes(app, remoteHosts.conversations);
   installProjectRoutes(app, remoteHosts.projectChats);
+  installModelRoutes(app, remoteHosts.models);
 
   // ── Landing page ──
 

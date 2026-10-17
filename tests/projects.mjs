@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, writeFile, readFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -91,13 +91,49 @@ test('saved projects are host-bound and thread filtering uses explicit membershi
   assert.equal(candidates.truncated, false);
 });
 
+test('native identity retains every root and accepts aliases only from the current local profile', async t => {
+  const f = await catalogFixture(t);
+  f.state['local-projects'][localProject].rootPaths.push('/second/workspace');
+  f.state['app-server-project-id-by-legacy-project-id-by-host']['local:/other/profile'] = { [localProject]: 'other-native-id' };
+  await writeFile(f.statePath, JSON.stringify(f.state));
+  const catalog = new CodexProjectsCatalog({ statePath: f.statePath, env: { CODEX_HOME: '/user/.codex' }, requireHost: async () => {} });
+  assert.deepEqual(await catalog.nativeLocalIdentity(localProject), { projectId: localProject,
+    rootPaths: [localPath, '/second/workspace'], candidateIds: [localProject, 'server-local-id'] });
+  await assert.rejects(catalog.nativeLocalIdentity(remoteProject));
+  f.state['local-projects'][localProject].rootPaths.push('relative/workspace');
+  await writeFile(f.statePath, JSON.stringify(f.state));
+  await assert.rejects(catalog.nativeLocalIdentity(localProject), error => error.code === 'project_identity_unavailable');
+});
+
+test('native membership fills null Desktop project IDs without overriding visibility or explicit assignments', async t => {
+  const f = await catalogFixture(t);
+  let members = [f.ids[4], f.ids[3], f.ids[5], f.ids[6], f.ids[8]];
+  let unavailable = false, reads = 0;
+  const catalog = new CodexProjectsCatalog({ statePath: f.statePath, databasePath: join(f.root, 'catalog.db'), pageSize: 2,
+    env: { CODEX_HOME: '/user/.codex' }, requireHost: async () => {}, nativeProjectThreads: async identity => {
+      reads++; assert(identity.candidateIds.includes('server-local-id'));
+      if (unavailable) throw new Error('Native catalogue is unavailable');
+      return { projectId: 'server-local-id', threadIds: members };
+    } });
+  const first = await catalog.listThreads('local', localProject);
+  const second = await catalog.listThreads('local', localProject, { cursor: first.nextCursor });
+  assert.deepEqual([...first.threads, ...second.threads].map(thread => thread.id), [f.ids[7], f.ids[4], f.ids[1], f.ids[0]]);
+  members = [];
+  const current = await catalog.creationCandidates('local', localProject, new Date(0).toISOString());
+  assert(!current.threads.some(thread => thread.id === f.ids[4]), 'native membership must be refreshed after removal');
+  const before = reads; await catalog.listThreads(remote, remoteProject); assert.equal(reads, before);
+  unavailable = true;
+  await assert.rejects(catalog.listThreads('local', localProject), error => error.code === 'project_chats_unavailable');
+});
+
 async function creationFixture(t, custom = {}) {
   const f = await catalogFixture(t);
   const calls = [];
   const waiters = [];
   const controls = { calls, resolve: null, reject: null, readyFailure: false,
     waitForCalls: count => calls.length >= count ? Promise.resolve() : new Promise(resolve => waiters.push({ count, resolve })) };
-  const tools = { executorThreadId: helperId, close() {}, recoverChat: async () => controls.recovered ?? { state: 'unknown' },
+  const tools = { executorThreadId: helperId, close() {}, recoverChat: async input => controls.recover
+    ? controls.recover(input) : controls.recovered ?? { state: 'unknown' },
     ready: async () => { if (controls.readyFailure) throw new Error('PRIVATE_SERVICE_ERROR'); },
     createChat: async input => { calls.push(input); return new Promise((resolve, reject) => {
       controls.resolve = resolve; controls.reject = reject;
@@ -135,6 +171,63 @@ test('creation is idempotent across concurrent requests, fixed to its saved proj
   assert.equal(receipt.thread.cwd, localPath); assert(!JSON.stringify(receipt).includes(input.prompt));
   assert.throws(() => f.service.get(remote, remoteProject, input.id), error => error.status === 404);
   assert.equal((await f.open().accept(input)).duplicate, true);
+  assert.equal(f.calls.length, 1);
+});
+
+test('new local creation uses a durable native executor without a helper and preserves a created thread when its first message is unsent', async t => {
+  const nativeCalls = [], recovered = [];
+  const thread = native(randomUUID()).thread;
+  const observation = { state: 'created', hostId: 'local', thread, projectVerified: true, firstMessageState: 'not_sent' };
+  const localExecutor = { ready: async () => {}, close() {}, createChat: async input => { nativeCalls.push(input); return observation; },
+    recoverChat: async input => { recovered.push(input); return observation; } };
+  const f = await creationFixture(t, { localExecutor, requireSelection: async () => {} });
+  const input = message({ selection: { model: 'fixture-model', reasoningEffort: 'max' } });
+  f.controls.readyFailure = true;
+  assert((await f.service.projects('local')).projects.every(project => project.canCreate));
+  assert((await f.service.projects(remote)).projects.every(project => !project.canCreate));
+  await Promise.all([f.service.accept(input), f.service.accept(input)]);
+  while (f.service.get('local', localProject, input.id).state === 'pending') await tick();
+  await tick();
+  const receipt = f.service.get('local', localProject, input.id);
+  assert.equal(receipt.state, 'unknown'); assert.equal(receipt.creationMethod, 'native');
+  assert.equal(receipt.firstMessageState, 'not_sent'); assert.equal(receipt.thread.id, thread.id);
+  assert.equal(receipt.canRetry, false); assert.match(receipt.notice, /first message was not sent/);
+  assert.equal(f.service.hasThread('local', thread.id), true);
+  assert.equal(nativeCalls.length, 1); assert.equal(f.calls.length, 0);
+  assert.equal(nativeCalls[0].executorThreadId, undefined); assert.deepEqual(nativeCalls[0].selection, input.selection);
+  const stored = JSON.parse(await readFile(join(f.root, 'receipts', `${input.id}.json`), 'utf8'));
+  assert.equal(stored.executorKind, 'native'); assert.equal(stored.executorThreadId, undefined);
+  f.service.close();
+  const restored = f.open();
+  assert.equal((await restored.accept(input)).duplicate, true);
+  assert.equal((await restored.status('local', localProject, input.id)).thread.id, thread.id);
+  assert.equal(recovered.length, 1); assert.equal(nativeCalls.length, 1); assert.equal(f.calls.length, 0);
+  await assert.rejects(restored.retry(input.id, { hostId: 'local', projectId: localProject, attemptId: input.id }),
+    error => error.code === 'creation_retry_unavailable');
+  f.controls.readyFailure = false;
+  const remoteInput = message({ hostId: remote, projectId: remoteProject });
+  await restored.accept(remoteInput); await f.controls.waitForCalls(1);
+  assert.equal(f.calls[0].executorThreadId, helperId);
+  assert.equal(restored.get(remote, remoteProject, remoteInput.id).creationMethod, 'companion');
+  f.controls.resolve(native(randomUUID(), remote)); await tick();
+});
+
+test('a legacy local job still recovers through its original companion after native creation is enabled', async t => {
+  const f = await creationFixture(t);
+  const input = message();
+  await f.service.accept(input); await f.controls.waitForCalls(1);
+  f.controls.resolve({ state: 'unknown' }); await tick(); f.service.close();
+  const path = join(f.root, 'receipts', `${input.id}.json`);
+  const legacy = JSON.parse(await readFile(path, 'utf8')); delete legacy.executorKind;
+  await writeFile(path, JSON.stringify(legacy));
+  f.options.localExecutor = { ready: async () => {}, close() {},
+    createChat: async () => assert.fail('Must not create a second local chat'),
+    recoverChat: async () => assert.fail('A legacy job belongs to its original companion') };
+  const result = native(randomUUID()); f.controls.recovered = result;
+  const restored = f.open();
+  assert.equal((await restored.accept(input)).duplicate, true);
+  const receipt = await restored.status('local', localProject, input.id);
+  assert.equal(receipt.thread.id, result.thread.id); assert.equal(receipt.creationMethod, 'companion');
   assert.equal(f.calls.length, 1);
 });
 
@@ -208,6 +301,139 @@ test('a modified immutable request is rejected before a helper can execute it', 
   assert.equal(f.service.get('local', localProject, input.id).state, 'failed'); assert.equal(f.calls.length, 0);
 });
 
+test('explicit creation settings require a host catalogue before admission', async t => {
+  const f = await creationFixture(t);
+  const input = message({ selection: { model: 'fixture-model', reasoningEffort: 'high' } });
+  await assert.rejects(f.service.accept(input), error => error.status === 503 && error.code === 'catalogue_unavailable');
+  await tick();
+  assert.equal(f.calls.length, 0);
+  assert.throws(() => f.service.get(input.hostId, input.projectId, input.id), error => error.status === 404);
+});
+
+test('creation freezes a host-validated selection in its ID, immutable request and restored receipt', async t => {
+  const validations = [];
+  const f = await creationFixture(t, { requireSelection: async (hostId, selection, hasImages) => {
+    validations.push({ hostId, selection: structuredClone(selection), hasImages });
+  } });
+  const selection = { model: 'fixture-model', reasoningEffort: 'high' };
+  const input = message({ hostId: remote, projectId: remoteProject, selection: { ...selection } });
+  const accepted = await f.service.accept(input);
+  assert.equal(accepted.receipt.modelVerification, 'pending');
+  input.selection.model = 'changed-after-send';
+  await f.controls.waitForCalls(1);
+  assert.deepEqual(f.calls[0].selection, selection);
+  assert.deepEqual(validations, Array.from({ length: 2 }, () => ({ hostId: remote, selection, hasImages: false })));
+  const stored = JSON.parse(await readFile(join(f.root, 'receipts', `${input.id}.json`), 'utf8'));
+  assert.equal(stored.version, 2);
+  assert.deepEqual(stored.selection, selection);
+  const immutable = JSON.parse(await readFile(f.calls[0].requestPath, 'utf8'));
+  assert.deepEqual(immutable.selection, selection);
+  await assert.rejects(f.service.accept(input), error => error.status === 409 && error.code === 'id_conflict');
+  await assert.rejects(f.service.accept({ ...input, selection: { ...selection, reasoningEffort: 'low' } }), error => error.status === 409);
+  const modelEvidence = { ...selection, reroutes: [] };
+  f.controls.resolve({ ...native(randomUUID(), remote), modelEvidence }); await tick();
+  const receipt = f.service.get(remote, remoteProject, input.id);
+  assert.equal(receipt.state, 'completed'); assert.equal(receipt.modelVerification, 'confirmed');
+  assert.deepEqual(receipt.selection, selection); assert.deepEqual(receipt.modelEvidence, modelEvidence);
+  const firstMessage = f.service.verifiedFirstMessage(remote, receipt.thread.id);
+  assert.deepEqual(firstMessage.selection, selection);
+  firstMessage.selection.model = 'changed-after-read';
+  assert.deepEqual(f.service.verifiedFirstMessage(remote, receipt.thread.id).selection, selection);
+  f.service.close();
+  const restored = f.open();
+  assert.deepEqual(restored.get(remote, remoteProject, input.id), receipt);
+  assert.equal((await restored.accept({ ...input, selection })).duplicate, true);
+  assert.equal(validations.length, 2); assert.equal(f.calls.length, 1);
+});
+
+test('an unavailable catalogue keeps an unsent creation pending and revalidates before eventual execution', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  let validations = 0;
+  let available = false;
+  let observedSecondValidation;
+  const secondValidation = new Promise(resolve => { observedSecondValidation = resolve; });
+  const f = await creationFixture(t, { requireSelection: async () => {
+    validations += 1;
+    if (validations === 2) observedSecondValidation();
+    if (validations > 1 && !available) throw new ConversationError('PRIVATE_CATALOGUE_ERROR', 503, 'catalogue_unavailable');
+  } });
+  const input = message({ selection: { model: 'fixture-model', reasoningEffort: 'high' } });
+  await f.service.accept(input); await secondValidation; await tick();
+  const waiting = f.service.get('local', localProject, input.id);
+  assert.equal(waiting.state, 'pending'); assert.equal(f.calls.length, 0);
+  assert(!JSON.stringify(waiting).includes('PRIVATE_'));
+  available = true;
+  t.mock.timers.tick(3000); await f.controls.waitForCalls(1);
+  assert.equal(validations, 3);
+  f.controls.resolve(native(randomUUID())); await tick();
+  const receipt = f.service.get('local', localProject, input.id);
+  assert.equal(receipt.state, 'completed'); assert.equal(receipt.modelVerification, 'unverified');
+  assert.match(receipt.notice, /could not confirm/i);
+  assert.equal(f.calls.length, 1);
+});
+
+test('a selection removed before dispatch fails without a helper send', async t => {
+  let validations = 0;
+  const f = await creationFixture(t, { requireSelection: async () => {
+    if (++validations > 1) throw new ConversationError('PRIVATE_REMOVED_MODEL', 422, 'model_unavailable');
+  } });
+  const input = message({ selection: { model: 'fixture-model', reasoningEffort: 'high' } });
+  await f.service.accept(input);
+  while (f.service.get('local', localProject, input.id).state === 'pending') await tick();
+  const failed = f.service.get('local', localProject, input.id);
+  assert.equal(failed.state, 'failed'); assert.equal(f.calls.length, 0);
+  assert(!JSON.stringify(failed).includes('PRIVATE_'));
+});
+
+test('an offline host model catalogue does not block queued creation on another host', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  let remoteValidations = 0;
+  let releaseRemote;
+  const remoteGate = new Promise((_, reject) => { releaseRemote = reject; });
+  let remoteStarted;
+  const started = new Promise(resolve => { remoteStarted = resolve; });
+  let trackRetry = false;
+  let retriedHost;
+  const retryStarted = new Promise(resolve => { retriedHost = resolve; });
+  const f = await creationFixture(t, { requireSelection: async hostId => {
+    if (trackRetry) retriedHost(hostId);
+    if (hostId === remote && ++remoteValidations > 1) {
+      remoteStarted(); await remoteGate;
+    }
+  } });
+  const selection = { model: 'fixture-model', reasoningEffort: 'high' };
+  const blocked = message({ hostId: remote, projectId: remoteProject, selection });
+  const available = message({ selection });
+  await f.service.accept(blocked); await started;
+  await f.service.accept(available); await tick();
+  releaseRemote(new ConversationError('Offline host catalogue.', 503, 'catalogue_unavailable')); await tick();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.service.get(remote, remoteProject, blocked.id).state, 'pending');
+  trackRetry = true;
+  t.mock.timers.tick(3000);
+  assert.equal(await retryStarted, 'local');
+  await f.controls.waitForCalls(1);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].id, available.id);
+  assert.equal(remoteValidations, 2);
+  f.controls.resolve(native(randomUUID())); await tick();
+  assert.equal(f.service.get('local', localProject, available.id).state, 'completed');
+});
+
+test('a created chat with native model substitution completes once and reports the difference', async t => {
+  const f = await creationFixture(t, { requireSelection: async () => {} });
+  const selection = { model: 'fixture-model', reasoningEffort: 'high' };
+  const input = message({ selection });
+  await f.service.accept(input); await f.controls.waitForCalls(1);
+  const modelEvidence = { model: 'substituted-model', reasoningEffort: 'high',
+    reroutes: [{ fromModel: 'fixture-model', toModel: 'substituted-model', reason: 'unavailable' }] };
+  f.controls.resolve({ ...native(randomUUID()), modelEvidence }); await tick();
+  const receipt = f.service.get('local', localProject, input.id);
+  assert.equal(receipt.state, 'completed'); assert.equal(receipt.modelVerification, 'different');
+  assert.match(receipt.notice, /different/i);
+  assert.equal((await f.service.accept(input)).duplicate, true); assert.equal(f.calls.length, 1);
+});
+
 test('project creation HTTP rejects unpaired requests and exposes only target-scoped receipts', async t => {
   const f = await creationFixture(t);
   const app = express();
@@ -225,4 +451,154 @@ test('project creation HTTP rejects unpaired requests and exposes only target-sc
   assert.equal((await fetch(`${paired}/api/codex/chats/${input.id}?hostId=local&projectId=other`)).status, 404);
   assert.equal((await fetch(`${paired}/api/codex/projects?hostId=local&hostId=${remote}`)).status, 400);
   assert.equal(f.calls.length, 1);
+});
+
+const approvalFailure = (input, attemptId = input.id) => ({ state: 'failed_before_execution', reason: 'approval_review_timeout',
+  proof: { requestId: input.id, attemptId, hostId: input.hostId, projectId: input.projectId, executorThreadId: helperId,
+    helperTurnId: randomUUID(), toolCallId: `exec-${randomUUID()}`, approvalReviewId: `automatic-approval-review:${randomUUID()}`,
+    verifiedAt: new Date().toISOString() } });
+
+test('one approval-timeout retry preserves the original request and admits concurrent retries only once', async t => {
+  const f = await creationFixture(t, { requireSelection: async () => {} });
+  const input = message({ selection: { model: 'fixture-model', reasoningEffort: 'high' } });
+  await f.service.accept(input); await f.controls.waitForCalls(1);
+  const failure = approvalFailure(input);
+  f.controls.resolve(failure); f.controls.recovered = failure; await tick();
+  const failed = f.service.get(input.hostId, input.projectId, input.id);
+  assert.equal(failed.state, 'failed'); assert.equal(failed.canRetry, true);
+  assert.equal(failed.failureCode, 'approval_review_timeout');
+  assert.equal(failed.attemptId, input.id); assert.equal(failed.attemptNumber, 1);
+  const immutableBefore = await readFile(f.calls[0].requestPath, 'utf8');
+  const body = { hostId: input.hostId, projectId: input.projectId, attemptId: failed.attemptId };
+  const results = await Promise.all([f.service.retry(input.id, body), f.service.retry(input.id, body)]);
+  assert.equal(results.filter(result => !result.duplicate).length, 1);
+  await f.controls.waitForCalls(2);
+  const execution = f.calls[1];
+  assert.equal(execution.id, input.id); assert.equal(execution.prompt, input.prompt);
+  assert.deepEqual(execution.selection, input.selection); assert.equal(execution.requestPath, f.calls[0].requestPath);
+  assert.notEqual(execution.retry.attemptId, input.id); assert.equal(execution.retry.attemptNumber, 2);
+  assert.deepEqual(execution.retry.previousFailure, failure.proof);
+  assert.equal(await readFile(execution.requestPath, 'utf8'), immutableBefore);
+  const stored = JSON.parse(await readFile(join(f.root, 'receipts', `${input.id}.json`), 'utf8'));
+  assert.deepEqual(stored.attempts.map(attempt => [attempt.id, attempt.number]), [[input.id, 1], [execution.retry.attemptId, 2]]);
+  assert.equal((await f.service.retry(input.id, body)).duplicate, true); assert.equal(f.calls.length, 2);
+  f.controls.resolve({ ...native(randomUUID()), modelEvidence: { ...input.selection, reroutes: [] } }); await tick();
+  const completed = f.service.get(input.hostId, input.projectId, input.id);
+  assert.equal(completed.state, 'completed'); assert.equal(completed.modelVerification, 'confirmed');
+  assert.equal(completed.attemptNumber, 2); assert.equal(completed.canRetry, false);
+  assert.equal((await f.service.retry(input.id, body)).receipt.thread.id, completed.thread.id);
+  assert.equal(f.calls.length, 2);
+});
+
+test('ordinary unknown is not retryable and a second native approval failure cannot create a third attempt', async t => {
+  const f = await creationFixture(t);
+  const input = message(); await f.service.accept(input); await f.controls.waitForCalls(1);
+  f.controls.resolve({ state: 'unknown' }); await tick();
+  const body = { hostId: input.hostId, projectId: input.projectId, attemptId: input.id };
+  await assert.rejects(f.service.retry(input.id, body), error => error.status === 409 && error.code === 'creation_retry_unavailable');
+  assert.equal(f.calls.length, 1);
+  f.controls.recovered = approvalFailure(input);
+  const recover = await f.service.status(input.hostId, input.projectId, input.id);
+  assert.equal(recover.canRetry, true); assert.equal(f.calls.length, 1);
+  const accepted = await f.service.retry(input.id, body); await f.controls.waitForCalls(2);
+  f.controls.resolve(approvalFailure(input, accepted.receipt.attemptId)); await tick();
+  const stopped = f.service.get(input.hostId, input.projectId, input.id);
+  assert.equal(stopped.state, 'failed'); assert.equal(stopped.canRetry, false);
+  assert.equal(stopped.failureCode, 'approval_review_timeout');
+  await assert.rejects(f.service.retry(input.id, { ...body, attemptId: stopped.attemptId }),
+    error => error.status === 409 && error.code === 'creation_retry_limit');
+  assert.equal((await f.service.retry(input.id, body)).duplicate, true);
+  assert.equal(f.calls.length, 2);
+});
+
+test('changed original-attempt evidence during retry stays read-only or restores the already-created chat', async t => {
+  for (const originalState of ['unknown', 'completed']) {
+    const f = await creationFixture(t);
+    const input = message(); await f.service.accept(input); await f.controls.waitForCalls(1);
+    const failure = approvalFailure(input); f.controls.resolve(failure); f.controls.recovered = failure; await tick();
+    const body = { hostId: input.hostId, projectId: input.projectId, attemptId: input.id };
+    const retry = await f.service.retry(input.id, body); await f.controls.waitForCalls(2);
+    const originalChat = native(randomUUID());
+    f.controls.resolve(originalState === 'completed' ? originalChat : { state: 'unknown' }); await tick();
+    const receipt = f.service.get(input.hostId, input.projectId, input.id);
+    assert.equal(receipt.state, originalState); assert.equal(receipt.canRetry, false);
+    assert.equal(receipt.error, undefined); assert.equal(receipt.attemptId, retry.receipt.attemptId);
+    if (originalState === 'completed') assert.equal(receipt.thread.id, originalChat.thread.id);
+    assert.equal((await f.service.accept(input)).duplicate, true);
+    assert.equal((await f.service.retry(input.id, body)).duplicate, true);
+    if (originalState === 'unknown') {
+      f.controls.recovered = originalChat;
+      const late = await f.service.status(input.hostId, input.projectId, input.id);
+      assert.equal(late.state, 'completed'); assert.equal(late.thread.id, originalChat.thread.id);
+      assert.equal(late.id, input.id); assert.equal(late.attemptId, retry.receipt.attemptId);
+    }
+    assert.equal(f.calls.length, 2);
+  }
+});
+
+test('a written retry survives restart without replay and an old recovery cannot replace its attempt', async t => {
+  const f = await creationFixture(t);
+  const input = message(); await f.service.accept(input); await f.controls.waitForCalls(1);
+  f.controls.resolve({ state: 'unknown' }); await tick();
+  let finishOldRecovery;
+  f.controls.recover = async () => new Promise(resolve => { finishOldRecovery = resolve; });
+  const recovery = f.service.status(input.hostId, input.projectId, input.id); await tick();
+  const body = { hostId: input.hostId, projectId: input.projectId, attemptId: input.id };
+  await assert.rejects(f.service.retry(input.id, body), error => error.status === 409 && error.code === 'creation_busy');
+  const failure = approvalFailure(input); finishOldRecovery(failure); await recovery;
+  delete f.controls.recover; f.controls.recovered = failure;
+  const retry = await f.service.retry(input.id, body); await f.controls.waitForCalls(2);
+  f.service.close();
+  const restored = f.open();
+  const unknown = restored.get(input.hostId, input.projectId, input.id);
+  assert.equal(unknown.state, 'unknown'); assert.equal(unknown.attemptId, retry.receipt.attemptId);
+  assert.equal((await restored.retry(input.id, body)).duplicate, true);
+  const completed = native(randomUUID()); f.controls.recovered = completed;
+  assert.equal((await restored.status(input.hostId, input.projectId, input.id)).thread.id, completed.thread.id);
+  assert.equal(f.calls.length, 2);
+});
+
+test('retry HTTP requires pairing, the original target and a fixed attempt token', async t => {
+  const f = await creationFixture(t);
+  const input = message(); await f.service.accept(input); await f.controls.waitForCalls(1);
+  const failure = approvalFailure(input); f.controls.resolve(failure); f.controls.recovered = failure; await tick();
+  const app = express();
+  app.use((req, res, next) => { if (req.path.startsWith('/device/test/api/')) { res.locals.autoReplyAuthorized = true; req.url = req.url.slice('/device/test'.length); } next(); });
+  app.use(express.json()); installProjectRoutes(app, f.service);
+  const server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const body = { hostId: input.hostId, projectId: input.projectId, attemptId: input.id };
+  const post = (prefix, value) => fetch(`${base}${prefix}/api/codex/chats/${input.id}/retry`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value) });
+  assert.equal((await post('', body)).status, 403);
+  assert.equal((await post('/device/test', { ...body, prompt: 'Changed' })).status, 400);
+  assert.equal((await post('/device/test', { ...body, hostId: remote, projectId: remoteProject })).status, 404);
+  assert.equal((await post('/device/test', { ...body, attemptId: randomUUID() })).status, 409);
+  const replies = await Promise.all([post('/device/test', body), post('/device/test', body)]);
+  assert.deepEqual(replies.map(reply => reply.status).sort(), [200, 202]);
+  await f.controls.waitForCalls(2); assert.equal(f.calls.length, 2);
+  f.controls.resolve(native(randomUUID())); await tick();
+});
+
+test('a failed retry commit leaves no dispatchable attempt and can be admitted after storage recovers', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  let validations = 0;
+  let blockedPath;
+  const f = await creationFixture(t, { requireSelection: async () => { if (++validations === 3) mkdirSync(blockedPath); } });
+  const input = message({ selection: { model: 'fixture-model', reasoningEffort: 'high' } });
+  blockedPath = join(f.root, 'receipts', `${input.id}.json.tmp`);
+  await f.service.accept(input); await f.controls.waitForCalls(1);
+  const failure = approvalFailure(input); f.controls.resolve(failure); f.controls.recovered = failure; await tick();
+  const body = { hostId: input.hostId, projectId: input.projectId, attemptId: input.id };
+  await assert.rejects(f.service.retry(input.id, body));
+  const unchanged = f.service.get(input.hostId, input.projectId, input.id);
+  assert.equal(unchanged.state, 'failed'); assert.equal(unchanged.attemptNumber, 1); assert.equal(unchanged.canRetry, true);
+  t.mock.timers.tick(3000); await tick(); assert.equal(f.calls.length, 1);
+  const persisted = JSON.parse(await readFile(join(f.root, 'receipts', `${input.id}.json`), 'utf8'));
+  assert.equal(persisted.attempts.length, 1);
+  await rm(blockedPath, { recursive: true });
+  await f.service.retry(input.id, body); await f.controls.waitForCalls(2);
+  f.controls.resolve(native(randomUUID())); await tick();
+  assert.equal(f.service.get(input.hostId, input.projectId, input.id).state, 'completed');
 });

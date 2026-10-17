@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { CodexDesktopIpc, CodexDesktopIpcError } from '../src/codex-desktop-ipc.ts';
+import * as desktopIpc from '../src/codex-desktop-ipc.ts';
 
 const host = 'remote-control:env_test_remote';
 const otherHost = 'remote-control:env_other_remote';
@@ -182,6 +183,106 @@ test('text-only and multiple images use native input with the same fixed local o
       assert.equal(f.requests.filter(request => request.method === 'thread-follower-start-turn').length, 2);
     });
   }
+});
+
+test('a selected model travels with the turn while preserving the native mode, instructions and permission inheritance', async t => {
+  for (const hostId of ['local', host]) {
+    await t.test(hostId, async t => {
+      const f = await fixture(t, { hostId });
+      const nativeMode = { mode: 'plan', settings: { model: 'previous-model', reasoning_effort: 'medium',
+        developer_instructions: 'Preserve the existing planning instructions.', futureSetting: { enabled: true } } };
+      f.state.latestThreadSettings = { collaborationMode: structuredClone(nativeMode), approvalPolicy: 'on-request' };
+      f.state.latestCollaborationMode = { mode: 'default', settings: { model: 'older-model', reasoning_effort: 'low', developer_instructions: null } };
+      const selection = { model: 'host-catalog-model', reasoningEffort: 'host-catalog-effort' };
+      const ipc = await f.connect();
+      await ipc.startMessageTurn({ hostId, threadId: thread, clientUserMessageId: submission,
+        text: 'Use the selected configuration.', attachments: [], selection });
+      const sent = f.requests.find(request => request.method === 'thread-follower-start-turn');
+      assert.deepEqual(sent.params.turnStart.request.collaborationMode, { ...nativeMode,
+        settings: { ...nativeMode.settings, model: selection.model, reasoning_effort: selection.reasoningEffort } });
+      assert.deepEqual(f.state.latestThreadSettings.collaborationMode, nativeMode, 'preparing a send must not edit the observed native settings');
+      assert.deepEqual(sent.params.turnStart.context, { inheritThreadSettings: true });
+      assert(!Object.hasOwn(sent.params.turnStart.request, 'approvalPolicy'));
+      assert(!Object.hasOwn(sent.params.turnStart.request, 'sandboxPolicy'));
+      assert(!f.requests.some(request => request.method === 'thread-follower-update-thread-settings'));
+    });
+  }
+});
+
+test('an image send freezes its selection before asynchronous history loading and supports the older mode location', async t => {
+  let releaseHistory, historyRequested;
+  const reachedHistory = new Promise(resolve => { historyRequested = resolve; });
+  const historyGate = new Promise(resolve => { releaseHistory = resolve; });
+  const f = await fixture(t, { request: async (request) => {
+    if (request.method === 'thread-follower-load-complete-history') {
+      historyRequested();
+      await historyGate;
+    }
+    return false;
+  } });
+  f.state.latestCollaborationMode = { mode: 'default', settings: { model: 'previous-model', reasoning_effort: 'low', developer_instructions: null } };
+  const selection = { model: 'selected-model', reasoningEffort: 'max' };
+  const ipc = await f.connect();
+  const sending = ipc.startImageTurn({ ...imageTurn, selection });
+  await reachedHistory;
+  selection.model = 'later-draft-model'; selection.reasoningEffort = 'low';
+  releaseHistory();
+  await sending;
+  const sent = f.requests.find(request => request.method === 'thread-follower-start-turn');
+  assert.deepEqual(sent.params.turnStart.request.collaborationMode, { mode: 'default', settings: {
+    model: 'selected-model', reasoning_effort: 'max', developer_instructions: null,
+  } });
+});
+
+test('explicit selections fail before sending when the pair or inherited mode is unavailable', async t => {
+  const f = await fixture(t);
+  const ipc = await f.connect();
+  for (const selection of [null, { model: '', reasoningEffort: 'max' }, { model: ' model', reasoningEffort: 'max' },
+    { model: 'model', reasoningEffort: '' }, { model: 'model', reasoningEffort: 'max', approvalPolicy: 'never' }]) {
+    await assert.rejects(ipc.startMessageTurn({ hostId: host, threadId: thread, clientUserMessageId: submission,
+      text: 'Test selection validation.', attachments: [], selection }),
+    error => error.outcome === 'not_sent' && error.code === 'invalid_model_selection');
+  }
+  const input = { hostId: host, threadId: thread, clientUserMessageId: submission,
+    text: 'Do not replace missing instructions with defaults.', attachments: [], selection: { model: 'selected-model', reasoningEffort: 'max' } };
+  await assert.rejects(ipc.startMessageTurn(input), error => error.outcome === 'not_sent' && error.code === 'model_settings_unavailable');
+  f.state.latestCollaborationMode = { mode: 'default', settings: { developer_instructions: null } };
+  f.state.latestThreadSettings = { collaborationMode: { mode: 'plan', settings: { developer_instructions: 123 } } };
+  await assert.rejects(ipc.startMessageTurn(input), error => error.outcome === 'not_sent' && error.code === 'model_settings_unavailable');
+  assert(!f.requests.some(request => request.method === 'thread-follower-start-turn'));
+});
+
+test('native first-message defaults preserve an explicitly unset effort and Desktop developer instructions', async t => {
+  const f = await fixture(t, { hostId: 'local' });
+  f.state.latestThreadSettings = { collaborationMode: { mode: 'default', settings: {
+    model: 'desktop-global-model', reasoning_effort: 'high', developer_instructions: 'Keep Desktop context.' } } };
+  const ipc = await f.connect();
+  await ipc.startMessageTurn({ hostId: 'local', threadId: thread, clientUserMessageId: submission,
+    text: 'First native message.', attachments: [], initialModelSettings: { model: 'native-default-model', reasoningEffort: null } });
+  const sent = f.requests.find(request => request.method === 'thread-follower-start-turn');
+  assert.deepEqual(sent.params.turnStart.request.collaborationMode, { mode: 'default', settings: {
+    model: 'native-default-model', reasoning_effort: null, developer_instructions: 'Keep Desktop context.' } });
+  assert.deepEqual(sent.params.turnStart.context, { inheritThreadSettings: true });
+  await assert.rejects(ipc.startMessageTurn({ hostId: 'local', threadId: thread, clientUserMessageId: submission,
+    text: 'Ambiguous settings.', attachments: [], selection: { model: 'one', reasoningEffort: 'max' },
+    initialModelSettings: { model: 'two', reasoningEffort: null } }), error => error.code === 'invalid_model_selection');
+  assert.equal(f.requests.filter(request => request.method === 'thread-follower-start-turn').length, 1);
+});
+
+test('turn model evidence comes from that turn and retains native rerouting instead of assuming the requested model ran', () => {
+  const nativeTurn = { params: { model: null, effort: null, collaborationMode: { mode: 'plan', settings: {
+    model: 'selected-model', reasoning_effort: 'max', developer_instructions: 'Private instructions must not enter evidence.',
+  } } }, items: [{ type: 'modelRerouted', fromModel: 'selected-model', toModel: 'native-routed-model', reason: 'nativeReason' }] };
+  assert.deepEqual(desktopIpc.readTurnModelEvidence(nativeTurn), { model: 'selected-model', reasoningEffort: 'max',
+    reroutes: [{ fromModel: 'selected-model', toModel: 'native-routed-model', reason: 'nativeReason' }] });
+  assert.deepEqual(desktopIpc.readTurnModelEvidence({ params: { model: 'remote-model', effort: 'high', collaborationMode: null }, items: [] }),
+    { model: 'remote-model', reasoningEffort: 'high', reroutes: [] });
+  assert.deepEqual(desktopIpc.readTurnModelEvidence({ params: { model: 'remote-model', effort: null }, items: [] }),
+    { model: 'remote-model', reasoningEffort: null, reroutes: [] });
+  assert.equal(desktopIpc.readTurnModelEvidence({ latestModel: 'current-model', latestReasoningEffort: 'max', items: [] }), undefined);
+  assert.equal(desktopIpc.readTurnModelEvidence({ params: { model: 'different-model', effort: 'max',
+    collaborationMode: nativeTurn.params.collaborationMode }, items: [] }), undefined);
+  assert.equal(desktopIpc.readTurnModelEvidence({ ...nativeTurn, items: [{ type: 'modelRerouted', toModel: 'unknown-origin' }] }), undefined);
 });
 
 test('busy and incomplete chats reject before mutation, and a later idle attempt can proceed', async t => {

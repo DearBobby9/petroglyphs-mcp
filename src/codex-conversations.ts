@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
-import { CodexDesktopIpcError, type MessageTurn } from './codex-desktop-ipc.js';
+import { CodexDesktopIpcError, readTurnModelEvidence, type CodexModelSelection, type DesktopTurnModelEvidence, type MessageTurn } from './codex-desktop-ipc.js';
+import { modelSelectionSchema, modelEvidenceSchema, modelVerificationFor, type ModelVerification } from './codex-model-selection.js';
 import { ConversationError, imageBytes, isCodexHost, messageFingerprint, parseMessageInput } from './codex-message-input.js';
 import { conversationRunState, historyMessages, historyTurns, record, type ConversationAttachment,
   type ConversationMessage, type HistoryMessage, type HistoryTurn } from './codex-conversation-history.js';
@@ -16,6 +17,7 @@ export interface ConversationConnection {
 export interface MessageReceipt {
   id: string; hostId: string; threadId: string; createdAt: string; updatedAt: string;
   state: ConversationMessage['state']; turnId?: string; message: ConversationMessage; error?: string; notice?: string;
+  selection?: CodexModelSelection; modelEvidence?: DesktopTurnModelEvidence; modelVerification?: ModelVerification;
 }
 export interface ConversationPage {
   hostId: string; threadId: string; messages: ConversationMessage[]; beforeCursor: string | null;
@@ -26,8 +28,9 @@ interface Options {
   legacyDataDir?: string;
   connect: () => Promise<ConversationConnection>;
   requireTarget: (hostId: string, threadId: string) => Promise<unknown>;
+  requireSelection?: (hostId: string, selection: CodexModelSelection, hasImages: boolean) => Promise<unknown>;
   verifiedFirstMessage?: (hostId: string, threadId: string) => {
-    id: string; turnId: string; sourceMessageId?: string; text: string; createdAt: string;
+    id: string; turnId: string; sourceMessageId?: string; text: string; createdAt: string; selection?: CodexModelSelection;
   } | undefined;
   retryMs?: number;
 }
@@ -41,6 +44,7 @@ const jobSchema = z.object({
   state: z.enum(['pending', 'dispatching', 'queued', 'running', 'completed', 'failed', 'unknown']),
   turnId: z.string().optional(), observedMessageId: z.string().optional(), turnFinished: z.boolean().optional(),
   error: z.string().optional(), notice: z.string().optional(),
+  selection: modelSelectionSchema.optional(), modelEvidence: modelEvidenceSchema.optional(),
 }).strict();
 type Job = z.infer<typeof jobSchema>;
 const assetSchema = z.object({ id: sha, hostId: host, threadId: uuid, name: z.string().max(200),
@@ -139,6 +143,9 @@ export class CodexConversations {
   private receipt(job: Job): MessageReceipt {
     return { id: job.id, hostId: job.hostId, threadId: job.threadId, createdAt: job.createdAt, updatedAt: job.updatedAt,
       state: job.state, ...(job.turnId ? { turnId: job.turnId } : {}), message: this.message(job),
+      ...(job.selection ? { selection: { ...job.selection },
+        modelVerification: modelVerificationFor(job.selection, job.modelEvidence, Boolean(job.turnId)) } : {}),
+      ...(job.modelEvidence ? { modelEvidence: structuredClone(job.modelEvidence) } : {}),
       ...(job.error ? { error: job.error } : {}), ...(job.notice ? { notice: job.notice } : {}) };
   }
 
@@ -153,6 +160,7 @@ export class CodexConversations {
     const first = existing();
     if (first) return { receipt: this.receipt(first), duplicate: true };
     await this.options.requireTarget(input.hostId, input.threadId);
+    await this.requireSelection(input.hostId, input.selection, input.attachments.length > 0);
     // Target lookup is asynchronous; a concurrent HTTP retry may already have
     // persisted this UUID while it was in flight.
     const second = existing();
@@ -163,7 +171,8 @@ export class CodexConversations {
     }
     const now = new Date().toISOString();
     const job: Job = { version: 1, id: input.id, hostId: input.hostId, threadId: input.threadId, text: input.text,
-      fingerprint, createdAt: now, updatedAt: now, state: 'pending', attachments: input.attachments.map(attachment => ({
+      fingerprint, ...(input.selection ? { selection: { ...input.selection } } : {}),
+      createdAt: now, updatedAt: now, state: 'pending', attachments: input.attachments.map(attachment => ({
         id: attachment.id, name: attachment.name, mimeType: attachment.mimeType,
         assetId: this.persistAsset(input.hostId, input.threadId, attachment.name, attachment.mimeType,
           imageBytes(attachment.dataBase64, attachment.mimeType)).id,
@@ -171,6 +180,12 @@ export class CodexConversations {
     this.save(job); this.jobs.set(job.id, job);
     setImmediate(() => { void this.drain(); });
     return { receipt: this.receipt(job), duplicate: false };
+  }
+
+  private async requireSelection(hostId: string, selection: CodexModelSelection | undefined, hasImages: boolean): Promise<void> {
+    if (!selection) return;
+    if (!this.options.requireSelection) throw new ConversationError('The model catalogue is unavailable for this connection.', 503, 'catalogue_unavailable');
+    await this.options.requireSelection(hostId, { ...selection }, hasImages);
   }
 
   async get(hostId: string, threadId: string, id: string): Promise<MessageReceipt> {
@@ -212,7 +227,10 @@ export class CodexConversations {
       const first = this.options.verifiedFirstMessage?.(hostId, threadId);
       const firstTurn = first && turns.find(turn => turn.id === first.turnId);
       if (first && firstTurn) {
-        const original = first.sourceMessageId && messages.find(message => message.id === first.sourceMessageId && message.role === 'user');
+        // Native creation can save the turn receipt before Desktop publishes
+        // its user item. Match that later item by identity within the saved turn.
+        const original = messages.find(message => message.role === 'user' && message.turnId === first.turnId
+          && (first.sourceMessageId ? message.id === first.sourceMessageId : message.clientMessageId === first.id));
         if (original) { original.text = first.text; original.clientMessageId = first.id; }
         else if (!first.sourceMessageId) {
           // Only a durably verified create request can expose an initial
@@ -239,6 +257,7 @@ export class CodexConversations {
       if (!turn || job.state === 'pending') continue;
       const before = JSON.stringify(job);
       job.turnId = turn.id;
+      job.modelEvidence = readTurnModelEvidence(turn);
       if (message) job.observedMessageId = message.id;
       job.turnFinished = ['completed', 'failed', 'interrupted'].includes(turn.status);
       job.state = turn.status === 'completed' ? 'completed' : turn.status === 'inProgress' ? 'running'
@@ -315,6 +334,20 @@ export class CodexConversations {
     const start = Math.max(0, end - limit);
     const page = messages.slice(start, end).map(message => 'imageInputs' in message ? this.publicMessage(message, hostId, threadId) : message);
     const receipts = jobs.filter((job, index) => unfinished(job) || index >= jobs.length - 50).map(job => this.receipt(job));
+    const first = this.options.verifiedFirstMessage?.(hostId, threadId);
+    if (first?.selection && !receipts.some(receipt => receipt.id === first.id)) {
+      const turn = snapshot.turns.find(turn => turn.id === first.turnId);
+      const message = snapshot.messages.find(message => message.clientMessageId === first.id && message.turnId === first.turnId);
+      if (turn && message) {
+        const evidence = readTurnModelEvidence(turn);
+        // Creation can be confirmed before its response finishes. Derive this
+        // receipt on every history read so a later native reroute stays visible.
+        receipts.push({ id: first.id, hostId, threadId, createdAt: first.createdAt, updatedAt: new Date().toISOString(),
+          turnId: turn.id, state: message.state, message: this.publicMessage(message, hostId, threadId),
+          selection: { ...first.selection }, modelVerification: modelVerificationFor(first.selection, evidence, true),
+          ...(evidence ? { modelEvidence: evidence } : {}) });
+      }
+    }
     return { hostId, threadId, messages: page,
       beforeCursor: start > 0 ? Buffer.from(JSON.stringify({ v: 1, hostId, threadId, id: messages[start].id })).toString('base64url') : null,
       runState: conversationRunState(snapshot.state), receipts, updatedAt: new Date().toISOString() };
@@ -358,6 +391,15 @@ export class CodexConversations {
         this.save(first); continue;
       }
       if (this.closed) return;
+      try {
+        await this.requireSelection(first.hostId, first.selection, first.attachments.length > 0);
+      } catch (error) {
+        if (error instanceof CodexRoutingError && [400, 404, 422].includes(error.status)) {
+          first.state = 'failed'; first.error = 'The selected model or reasoning effort is no longer available. Choose a valid pair for a new message.';
+        } else first.notice = 'Waiting to confirm the selected model on this connection.';
+        this.save(first); continue;
+      }
+      if (this.closed) return;
       let attachments: MessageTurn['attachments'];
       try {
         attachments = first.attachments.map(attachment => ({ mimeType: attachment.mimeType,
@@ -371,7 +413,8 @@ export class CodexConversations {
       first.state = 'dispatching'; delete first.notice; this.save(first);
       try {
         const result = await connection.startMessageTurn({ hostId: first.hostId, threadId: first.threadId,
-          clientUserMessageId: first.id, text: first.text, attachments });
+          clientUserMessageId: first.id, text: first.text, attachments,
+          ...(first.selection ? { selection: { ...first.selection } } : {}) });
         if (result.clientUserMessageId !== first.id || !isThreadId(result.turnId)) throw new Error('Invalid receipt');
         first.turnId = result.turnId;
         if (first.state === 'dispatching') { first.state = 'queued'; delete first.error; }

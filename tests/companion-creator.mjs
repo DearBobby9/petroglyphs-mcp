@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { CodexCompanionCreator, ProjectCreationNotSentError, projectCreationEnvelope } from '../src/codex-companion-creator.ts';
 import { CodexDesktopIpcError } from '../src/codex-desktop-ipc.ts';
@@ -35,6 +35,7 @@ function fixture(t, style = 'text', overrides = {}) {
   const controls = { startError: null, truncated: false, reads: [], readyHost: null };
   const client = { close() {}, async readSnapshot(hostId, id) {
     controls.reads.push([hostId, id]);
+    if (controls.readError) throw controls.readError;
     const value = snapshots.get(`${hostId}:${id}`);
     if (!value) throw new Error('Unavailable native snapshot');
     return { hostId, threadId: id, conversationState: value };
@@ -128,6 +129,23 @@ test('unknown receipt, partial history and indexing lag never cause a second hel
   assert.equal(f.calls.length, 1);
 });
 
+test('a uniquely matched live helper turn waits for its user envelope before final recovery validation', async t => {
+  for (const partialUser of [false, true]) {
+    const f = fixture(t, 'text', { selection: { model: 'fixture-model', reasoningEffort: 'high' } });
+    const completedItems = f.helperTurn.items;
+    f.helperTurn.status = 'inProgress';
+    f.helperTurn.items = partialUser
+      ? [{ ...completedItems[0], content: [{ type: 'text', text: 'PETROGLYPHS_CREATE_PROJECT_CHAT_V2\n' }] }]
+      : [];
+    assert.equal((await f.creator.recoverChat(f.input)).state, 'creating');
+    f.helperTurn.status = 'completed';
+    assert.equal((await f.creator.recoverChat(f.input)).state, 'unknown');
+    f.helperTurn.items = completedItems;
+    assert.equal((await f.creator.recoverChat(f.input)).state, 'completed');
+    assert.equal(f.calls.length, 0);
+  }
+});
+
 test('the supplied exec script forwards parsed immutable data without retyping or executing prompt content', async t => {
   const f = fixture(t, 'text', { prompt: 'Text containing `code`, ${danger}, "quotes", and \n中文.'.repeat(100) });
   const script = /```javascript\n([\s\S]*)\n```$/.exec(projectCreationEnvelope(f.input))[1];
@@ -144,4 +162,219 @@ test('the supplied exec script forwards parsed immutable data without retyping o
   request.projectId = 'different';
   await assert.rejects(run(tools, () => {}), /identity mismatch/);
   assert.equal(calls.length, 3);
+});
+
+test('persisted V1 companion envelopes retain their exact identity and remain recoverable', async t => {
+  const f = fixture(t, 'text', { id: '10000000-0000-4000-8000-000000000001',
+    hostId: 'remote-control:env_legacy_fixture', projectId: 'legacy-project', prompt: 'Legacy unchanged prompt.',
+    title: 'Legacy', createdAt: '2026-10-16T12:00:00.000Z',
+    requestPath: '/private/service/requests/legacy.json' });
+  const envelope = projectCreationEnvelope({ ...f.input, executorThreadId: '10000000-0000-4000-8000-000000000002' });
+  // Recovery compares the full user envelope. Changing even explanatory text
+  // would strand requests already written by the V1 bridge.
+  assert.equal(createHash('sha256').update(envelope).digest('hex'), 'e03052e57d374ebfb4c48ff6cda605f7365f9ef313a3419a3a96baf70792a8a7');
+  const selected = projectCreationEnvelope({ ...f.input, executorThreadId: '10000000-0000-4000-8000-000000000002',
+    selection: { model: 'fixture-model', reasoningEffort: 'high' } });
+  assert.equal(createHash('sha256').update(selected).digest('hex'), '0793f6f1ca73984c7fa4d564a7bdfe6e785471df2c010e2ad0a0a8d8bddbd98a');
+  assert.equal((await f.creator.recoverChat(f.input)).state, 'completed');
+  assert.equal(f.calls.length, 0);
+});
+
+test('V2 forwards the immutable selection to official creation and rejects mismatched file settings', async t => {
+  const selection = { model: 'fixture-model', reasoningEffort: 'high' };
+  const f = fixture(t, 'text', { selection });
+  const envelope = projectCreationEnvelope(f.input);
+  assert(envelope.startsWith('PETROGLYPHS_CREATE_PROJECT_CHAT_V2\n'));
+  const script = /```javascript\n([\s\S]*)\n```$/.exec(envelope)[1];
+  const request = { requestId: f.input.id, hostId: f.input.hostId, projectId: f.input.projectId,
+    prompt: f.input.prompt, title: f.input.title, selection: { ...selection } };
+  const creations = [];
+  const tools = { async exec_command() { return { exit_code: 0, output: JSON.stringify(request) }; },
+    async mcp__codex_app__create_thread(args) { creations.push(args); return { threadId: f.threadId }; } };
+  const run = new (Object.getPrototypeOf(async () => {}).constructor)('tools', 'text', script);
+  await run(tools, () => {});
+  assert.deepEqual(creations, [{ prompt: f.input.prompt, title: f.input.title,
+    target: { type: 'project', projectId: f.input.projectId, environment: { type: 'local' } },
+    model: selection.model, thinking: selection.reasoningEffort }]);
+  request.selection.reasoningEffort = 'low';
+  await assert.rejects(run(tools, () => {}), /selection mismatch/i);
+  assert.equal(creations.length, 1);
+});
+
+test('first-turn model evidence is independent of later chat settings and preserves native reroutes', async t => {
+  const selection = { model: 'fixture-model', reasoningEffort: 'high' };
+  const f = fixture(t, 'toolOutput', { selection });
+  f.firstTurn.params.model = selection.model;
+  f.firstTurn.params.effort = selection.reasoningEffort;
+  f.snapshots.get(`${f.input.hostId}:${f.threadId}`).latestThreadSettings = { model: 'later-model', reasoningEffort: 'low' };
+  const evidence = { ...selection, reroutes: [] };
+  assert.deepEqual((await f.creator.recoverChat(f.input)).modelEvidence, evidence);
+  const reroute = { type: 'modelRerouted', fromModel: selection.model, toModel: 'substitute', reason: 'unavailable' };
+  f.firstTurn.items.push(reroute);
+  const result = await f.creator.recoverChat(f.input);
+  assert.equal(result.state, 'completed');
+  assert.deepEqual(result.modelEvidence.reroutes, [{ fromModel: selection.model, toModel: 'substitute', reason: 'unavailable' }]);
+  delete f.firstTurn.params.model;
+  assert.equal((await f.creator.recoverChat(f.input)).modelEvidence, undefined);
+  assert.equal(f.calls.length, 0);
+});
+
+test('recorded creation arguments must match explicitly requested model and effort', async t => {
+  const selection = { model: 'fixture-model', reasoningEffort: 'high' };
+  for (const change of [{ model: 'other' }, { thinking: 'low' }, { model: undefined }]) {
+    const f = fixture(t, 'text', { selection });
+    f.helperTurn.items.push({ type: 'mcpToolCall', server: 'codex_app', tool: 'create_thread', arguments: {
+      prompt: f.input.prompt, title: f.input.title,
+      target: { type: 'project', projectId: f.input.projectId, environment: { type: 'local' } },
+      model: selection.model, thinking: selection.reasoningEffort, ...change,
+    } });
+    assert.equal((await f.creator.recoverChat(f.input)).state, 'unknown');
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+function approvalTimeoutFixture(t) {
+  const f = fixture(t, 'text', { selection: { model: 'fixture-model', reasoningEffort: 'high' } });
+  f.answer.text = JSON.stringify({ requestId: f.input.id, hostId: f.input.hostId, projectId: f.input.projectId, status: 'unknown' });
+  f.candidates.splice(0);
+  const call = { id: `exec-${randomUUID()}`, type: 'mcpToolCall', server: 'codex_app', tool: 'create_thread', status: 'failed',
+    arguments: { prompt: f.input.prompt, title: f.input.title, target: { type: 'project', projectId: f.input.projectId,
+      environment: { type: 'local' } }, model: f.input.selection.model, thinking: f.input.selection.reasoningEffort },
+    result: null, durationMs: 0, error: { message: 'The automatic permission approval review did not finish before its deadline. Do not assume the action is unsafe based on the timeout alone. You may retry once, or ask the user for guidance or explicit approval.' } };
+  const review = { id: `automatic-approval-review:${randomUUID()}`, type: 'automaticApprovalReview', targetItemId: call.id,
+    turnId: f.helperTurn.turnId, action: { type: 'mcpToolCall', server: 'codex_app', toolName: 'create_thread' },
+    status: 'timedOut', startedAtMs: now, completedAtMs: now + 90000 };
+  f.helperTurn.items.push(call, review);
+  return { ...f, call, review };
+}
+
+test('only exact native approval-timeout evidence with zero complete candidates proves execution did not start', async t => {
+  const f = approvalTimeoutFixture(t);
+  const result = await f.creator.recoverChat(f.input);
+  assert.equal(result.state, 'failed_before_execution');
+  assert.equal(result.reason, 'approval_review_timeout');
+  assert.equal(result.proof.requestId, f.input.id);
+  assert.equal(result.proof.attemptId, f.input.id);
+  assert.equal(result.proof.helperTurnId, f.helperTurn.turnId);
+  assert.equal(result.proof.toolCallId, f.call.id);
+  assert.equal(result.proof.approvalReviewId, f.review.id);
+  assert.equal(f.calls.length, 0);
+
+  for (const variation of ['missing-review', 'wrong-tool', 'wrong-turn', 'wrong-action', 'approved', 'duration', 'result',
+    'missing-arguments', 'changed-selection', 'extra-override', 'generic-timeout', 'candidates', 'truncated', 'duplicate-call', 'duplicate-review']) {
+    const bad = approvalTimeoutFixture(t);
+    if (variation === 'missing-review') bad.helperTurn.items.pop();
+    if (variation === 'wrong-tool') bad.review.targetItemId = `exec-${randomUUID()}`;
+    if (variation === 'wrong-turn') bad.review.turnId = randomUUID();
+    if (variation === 'wrong-action') bad.review.action.toolName = 'other';
+    if (variation === 'approved') bad.review.status = 'approved';
+    if (variation === 'duration') bad.call.durationMs = 1;
+    if (variation === 'result') bad.call.result = { content: [] };
+    if (variation === 'missing-arguments') delete bad.call.arguments;
+    if (variation === 'changed-selection') bad.call.arguments.thinking = 'low';
+    if (variation === 'extra-override') bad.call.arguments.cwd = '/other';
+    if (variation === 'generic-timeout') bad.call.error.message = 'Request timed out.';
+    if (variation === 'candidates') bad.candidates.push({ id: bad.threadId, title: 'Possible chat', cwd: '/saved/remote',
+      updatedAt: now / 1000, createdAt: Math.floor(now / 1000) });
+    if (variation === 'truncated') bad.controls.truncated = true;
+    if (variation === 'duplicate-call') bad.helperTurn.items.push({ ...bad.call, id: `exec-${randomUUID()}` });
+    if (variation === 'duplicate-review') bad.helperTurn.items.push({ ...bad.review, id: `automatic-approval-review:${randomUUID()}` });
+    assert.equal((await bad.creator.recoverChat(bad.input)).state, 'unknown', variation);
+    assert.equal(bad.calls.length, 0);
+  }
+});
+
+test('V3 retry uses one new native attempt with unchanged request data and rechecks its prior execution proof', async t => {
+  const f = approvalTimeoutFixture(t);
+  const previous = await f.creator.recoverChat(f.input);
+  assert.equal(previous.state, 'failed_before_execution');
+  const retry = { attemptId: randomUUID(), attemptNumber: 2, previousFailure: previous.proof };
+  const input = { ...f.input, retry };
+  const envelope = projectCreationEnvelope(input);
+  assert(envelope.startsWith('PETROGLYPHS_CREATE_PROJECT_CHAT_V3\n'));
+  assert(envelope.includes(retry.attemptId));
+  assert(envelope.includes(f.review.id));
+  const result = await f.creator.createChat(input);
+  assert.equal(result.state, 'unknown'); // This fixture deliberately has no acknowledgement of the second native attempt.
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].clientUserMessageId, retry.attemptId);
+  assert.equal(f.calls[0].text, envelope);
+  await f.creator.recoverChat(input); assert.equal(f.calls.length, 1);
+
+  const blocked = approvalTimeoutFixture(t);
+  const proof = await blocked.creator.recoverChat(blocked.input);
+  blocked.review.status = 'approved';
+  assert.equal((await blocked.creator.createChat({ ...blocked.input,
+    retry: { attemptId: randomUUID(), attemptNumber: 2, previousFailure: proof.proof } })).state, 'unknown');
+  assert.equal(blocked.calls.length, 0);
+});
+
+test('V3 preflight preserves an already-created original chat and keeps changed evidence uncertain', async t => {
+  for (const change of ['completed', 'creating', 'proof-identity']) {
+    const f = approvalTimeoutFixture(t);
+    const failure = await f.creator.recoverChat(f.input);
+    const input = { ...f.input, retry: { attemptId: randomUUID(), attemptNumber: 2, previousFailure: failure.proof } };
+    if (change === 'completed') {
+      f.call.status = 'completed'; f.call.result = { content: [{ type: 'text', text: JSON.stringify({ threadId: f.threadId, hostId: f.input.hostId }) }] };
+      f.call.error = null; f.call.durationMs = 10; f.review.status = 'approved';
+      f.answer.text = f.finalText();
+      f.candidates.push({ id: f.threadId, title: 'Original created chat', cwd: '/saved/remote', updatedAt: now / 1000,
+        createdAt: Math.floor(now / 1000) });
+    } else if (change === 'creating') f.helperTurn.status = 'inProgress';
+    else f.review.id = `automatic-approval-review:${randomUUID()}`;
+    const observed = await f.creator.createChat(input);
+    assert.equal(observed.state, change === 'completed' ? 'completed' : 'unknown', change);
+    if (change === 'completed') assert.equal(observed.thread.id, f.threadId);
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test('an unsent V3 attempt recovers a late original completion through read-only fallback', async t => {
+  const f = approvalTimeoutFixture(t);
+  const failure = await f.creator.recoverChat(f.input);
+  const input = { ...f.input, retry: { attemptId: randomUUID(), attemptNumber: 2, previousFailure: failure.proof } };
+  f.review.status = 'approved';
+  assert.equal((await f.creator.createChat(input)).state, 'unknown');
+  assert.equal(f.calls.length, 0);
+  f.call.status = 'completed'; f.call.result = { content: [{ type: 'text', text: JSON.stringify({ threadId: f.threadId, hostId: f.input.hostId }) }] };
+  f.call.error = null; f.call.durationMs = 10;
+  f.answer.text = f.finalText();
+  f.candidates.push({ id: f.threadId, title: 'Late original chat', cwd: '/saved/remote', updatedAt: now / 1000,
+    createdAt: Math.floor(now / 1000) });
+  const recovered = await f.creator.recoverChat(input);
+  assert.equal(recovered.state, 'completed'); assert.equal(recovered.thread.id, f.threadId);
+  assert.equal(recovered.firstTurnId, f.firstTurn.turnId);
+  assert.equal(f.calls.length, 0);
+});
+
+test('a completed V3 attempt recovers the same request only with its own exact attempt ID', async t => {
+  const f = approvalTimeoutFixture(t);
+  const failure = await f.creator.recoverChat(f.input);
+  const retry = { attemptId: randomUUID(), attemptNumber: 2, previousFailure: failure.proof };
+  const input = { ...f.input, retry };
+  const final = { requestId: input.id, attemptId: retry.attemptId, hostId: input.hostId,
+    projectId: input.projectId, status: 'created', threadId: f.threadId };
+  const answer = { type: 'agentMessage', phase: 'final_answer',
+    text: `${JSON.stringify(final)}\n::created-thread{threadId="${f.threadId}"}` };
+  const secondTurn = turn([user(projectCreationEnvelope(input), retry.attemptId), answer],
+    { params: { clientUserMessageId: retry.attemptId } });
+  f.snapshots.set(`local:${helper}`, state(helper, [f.helperTurn, secondTurn]));
+  f.candidates.push({ id: f.threadId, title: 'New chat', cwd: '/saved/remote', updatedAt: now / 1000, createdAt: Math.floor(now / 1000) });
+  f.firstTurn.params = { model: input.selection.model, effort: input.selection.reasoningEffort };
+  const result = await f.creator.recoverChat(input);
+  assert.equal(result.state, 'completed'); assert.equal(result.thread.id, f.threadId);
+  assert.deepEqual(result.modelEvidence, { ...input.selection, reroutes: [] });
+  delete final.attemptId;
+  answer.text = `${JSON.stringify(final)}\n::created-thread{threadId="${f.threadId}"}`;
+  assert.equal((await f.creator.recoverChat(input)).state, 'unknown');
+  assert.equal(f.calls.length, 0);
+});
+
+test('a disconnected V3 proof preflight remains definitely unsent and can wait on the same attempt', async t => {
+  const f = approvalTimeoutFixture(t);
+  const failure = await f.creator.recoverChat(f.input);
+  const input = { ...f.input, retry: { attemptId: randomUUID(), attemptNumber: 2, previousFailure: failure.proof } };
+  f.controls.readError = new Error('Native metadata connection closed before any write.');
+  await assert.rejects(f.creator.createChat(input), error => error instanceof ProjectCreationNotSentError && error.busy);
+  assert.equal(f.calls.length, 0);
 });

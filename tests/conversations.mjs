@@ -34,6 +34,78 @@ const state = (hostId, threadId, turns = [], busy = false) => ({ id: threadId, h
     entitiesByKey: Object.fromEntries(turns.map(turn => [turn.turnId, turn])),
   } } });
 
+test('explicit model pairs remain fixed across queueing, body retries and restart, including image messages', async t => {
+  const selected = { model: 'test-model-a', reasoningEffort: 'high' };
+  const checks = [];
+  const f = await fixture(t, { requireSelection: async (hostId, selection, hasImages) => {
+    checks.push({ hostId, selection: { ...selection }, hasImages });
+  } });
+  f.mode = 'busy';
+  const first = input('First selection', { selection: selected, attachments: [image()] });
+  const accepted = await f.service.accept(first);
+  assert.deepEqual(accepted.receipt.selection, selected);
+  assert.equal(accepted.receipt.modelVerification, 'pending');
+  await f.waitForAttempts(1);
+  selected.model = 'test-model-b';
+  await assert.rejects(f.service.accept(first), error => error.status === 409);
+  const original = { ...first, selection: { model: 'test-model-a', reasoningEffort: 'high' } };
+  assert.equal((await f.service.accept(original)).duplicate, true);
+  const attemptsBeforeRestart = f.attempts.length;
+  f.mode = 'normal';
+  const restored = f.restart();
+  await f.waitForAttempts(attemptsBeforeRestart + 1);
+  assert(f.attempts.every(attempt => JSON.stringify(attempt.selection) === JSON.stringify(original.selection)));
+  assert(checks.length >= 3);
+  assert(checks.every(check => check.hostId === host && check.selection.model === 'test-model-a' && check.hasImages));
+  const turn = f.turns.get(`${host}:${thread}`)[0];
+  turn.params.model = 'test-model-a'; turn.params.effort = 'high'; turn.status = 'completed';
+  const receipt = await restored.get(host, thread, first.id);
+  assert.equal(receipt.modelVerification, 'confirmed');
+  assert.deepEqual(receipt.modelEvidence, { model: 'test-model-a', reasoningEffort: 'high', reroutes: [] });
+  assert.equal((await f.restart().get(host, thread, first.id)).modelVerification, 'confirmed');
+});
+
+test('explicit configuration needs the host directory and is revalidated before any native write', async t => {
+  const pair = { model: 'test-model', reasoningEffort: 'high' };
+  const noCatalog = await fixture(t);
+  await assert.rejects(noCatalog.service.accept(input('No catalogue', { selection: pair })),
+    error => error.code === 'catalogue_unavailable');
+  assert.equal(noCatalog.attempts.length, 0);
+  let checks = 0, revalidated;
+  const checked = new Promise(resolve => { revalidated = resolve; });
+  const f = await fixture(t, { requireSelection: async () => {
+    if (++checks > 1) {
+      revalidated();
+      throw new ConversationError('Selected model was removed.', 400, 'invalid_model_selection');
+    }
+  } });
+  const message = input('Removed before dispatch', { selection: pair });
+  await f.service.accept(message);
+  await checked;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.attempts.length, 0);
+  const receipt = await f.service.get(host, thread, message.id);
+  assert.equal(receipt.state, 'failed');
+  assert.match(receipt.error, /model/i);
+});
+
+test('model verification uses matched turn evidence, surfaces reroutes and does not infer missing effort', async t => {
+  for (const kind of ['missing', 'missing-effort', 'different', 'rerouted']) {
+    const f = await fixture(t, { requireSelection: async () => {} });
+    const message = input(kind, { selection: { model: 'test-model', reasoningEffort: 'high' } });
+    await f.service.accept(message); await f.waitForAttempts(1);
+    const turn = f.turns.get(`${host}:${thread}`)[0];
+    turn.status = 'completed';
+    if (kind !== 'missing') turn.params.model = kind === 'different' ? 'another-model' : 'test-model';
+    if (kind !== 'missing-effort') turn.params.effort = 'high';
+    if (kind === 'rerouted') turn.items.push({ type: 'modelRerouted', fromModel: 'test-model', toModel: 'another-model', reason: 'capacity' });
+    const receipt = await f.service.get(host, thread, message.id);
+    assert.equal(receipt.state, 'completed');
+    assert.equal(receipt.modelVerification, kind.startsWith('missing') ? 'unverified' : 'different');
+    assert.equal(f.attempts.length, 1, 'configuration differences must not replay a completed message');
+  }
+});
+
 test('verified project creation projects the first user prompt once and keeps unrelated tool outputs private', async t => {
   for (const format of ['toolOutput', 'wrapped-user']) {
     const requestId = randomUUID();
@@ -55,6 +127,54 @@ test('verified project creation projects the first user prompt once and keeps un
     const again = await f.service.conversation(host, thread);
     assert.deepEqual(again.messages.map(message => message.id), page.messages.map(message => message.id));
   }
+});
+
+test('a created chat keeps first-turn model evidence current after creation has already completed', async t => {
+  const requestId = randomUUID(), selection = { model: 'test-model', reasoningEffort: 'high' };
+  const first = nativeTurn(randomUUID(), 'NATIVE_DELEGATION_WRAPPER', 'inProgress');
+  first.params = { model: selection.model, effort: selection.reasoningEffort };
+  first.items = first.items.filter(item => item.type !== 'userMessage');
+  const f = await fixture(t, { verifiedFirstMessage: () => ({ id: requestId, turnId: first.turnId,
+    text: 'First message', createdAt: new Date().toISOString(), selection }) });
+  f.turns.set(`${host}:${thread}`, [first]);
+  const initial = await f.service.conversation(host, thread);
+  assert.equal(initial.receipts[0].id, requestId);
+  assert.equal(initial.receipts[0].modelVerification, 'confirmed');
+  assert.equal(initial.receipts[0].state, 'running');
+  first.items.push({ type: 'modelRerouted', fromModel: 'test-model', toModel: 'fallback-model', reason: 'capacity' });
+  first.status = 'completed';
+  const final = await f.service.conversation(host, thread);
+  assert.equal(final.receipts[0].modelVerification, 'different');
+  assert.equal(final.receipts[0].modelEvidence.reroutes[0].toModel, 'fallback-model');
+  assert.equal(final.receipts[0].state, 'completed');
+  assert.equal(f.attempts.length, 0, 'history reconciliation never creates or sends another message');
+});
+
+test('a late native first message uses its real identity when the creation receipt has no source message ID', async t => {
+  const requestId = randomUUID(), selection = { model: 'gpt-6-luna', reasoningEffort: 'max' };
+  const text = 'Reply only IPAD_NATIVE_CREATE_OK.';
+  const first = nativeTurn(requestId, text, 'inProgress', { items: [] });
+  first.params = { clientUserMessageId: requestId, collaborationMode: { mode: 'default', settings: {
+    model: selection.model, reasoning_effort: selection.reasoningEffort, developer_instructions: null } } };
+  const f = await fixture(t, { verifiedFirstMessage: (hostId, threadId) => hostId === 'local' && threadId === thread
+    ? { id: requestId, turnId: first.turnId, text, createdAt: new Date().toISOString(), selection } : undefined });
+  f.turns.set(`local:${thread}`, [first]);
+  const pending = await f.service.conversation('local', thread);
+  assert.equal(pending.messages[0].id, `project:${requestId}`);
+
+  first.status = 'completed';
+  first.items = [{ id: randomUUID(), type: 'userMessage', clientId: requestId, content: [{ type: 'text', text }] },
+    { id: randomUUID(), type: 'agentMessage', phase: 'final_answer', text: 'IPAD_NATIVE_CREATE_OK' }];
+  const realUserId = historyMessages(historyTurns(state('local', thread, [first]), thread))[0].id;
+  const page = await f.service.conversation('local', thread);
+  assert.deepEqual(page.messages.map(message => message.role), ['user', 'assistant']);
+  assert.equal(page.messages.filter(message => message.clientMessageId === requestId).length, 1);
+  assert.equal(page.messages[0].id, realUserId);
+  assert.equal(page.messages[1].text, 'IPAD_NATIVE_CREATE_OK');
+  assert.equal(page.receipts[0].message.id, realUserId);
+  assert.equal(page.receipts[0].turnId, first.turnId);
+  assert.equal(page.receipts[0].modelVerification, 'confirmed');
+  assert.equal(f.attempts.length, 0);
 });
 
 async function fixture(t, overrides = {}) {

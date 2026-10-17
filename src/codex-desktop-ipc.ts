@@ -18,7 +18,8 @@ type RequestMethod = keyof typeof methodVersions;
 type JsonObject = Record<string, unknown>;
 type Delivery = 'not-sent' | 'unknown';
 export type DesktopIpcErrorCode = 'desktop_unavailable' | 'owner_unavailable' | 'follower_timeout'
-  | 'request_timeout' | 'connection_closed' | 'protocol_mismatch' | 'desktop_rejected' | 'invalid_receipt';
+  | 'request_timeout' | 'connection_closed' | 'protocol_mismatch' | 'desktop_rejected' | 'invalid_receipt'
+  | 'invalid_model_selection' | 'model_settings_unavailable';
 
 export class CodexDesktopIpcError extends Error {
   readonly outcome: 'not_sent' | 'unknown';
@@ -48,12 +49,26 @@ const settingsSchema = z.object({
   modelProvider: z.string().nullable().optional(),
 });
 export type DesktopModelSettings = z.infer<typeof settingsSchema>;
+/** A host-validated pair, fixed when its message is accepted. No implicit defaults. */
+export interface CodexModelSelection { readonly model: string; readonly reasoningEffort: string }
+export interface NativeInitialModelSettings { readonly model: string; readonly reasoningEffort: string | null }
+const modelSelectionSchema = z.object({
+  model: z.string().refine(value => settingValue(value, 256)),
+  reasoningEffort: z.string().refine(value => settingValue(value, 64)),
+}).strict();
+/** Native turn parameters and any observed reroutes; never inferred from current chat settings. */
+export interface DesktopTurnModelEvidence {
+  model: string;
+  reasoningEffort: string | null;
+  reroutes: Array<{ fromModel: string; toModel: string; reason: string }>;
+}
 export interface ImageTurn {
   hostId: string;
   threadId: string;
   submissionId: string;
   imageBase64: string;
   prompt: string;
+  selection?: CodexModelSelection;
 }
 export interface ImageTurnReceipt { turnId: string; clientUserMessageId: string }
 export interface MessageTurn {
@@ -62,6 +77,9 @@ export interface MessageTurn {
   clientUserMessageId: string;
   text: string;
   attachments: Array<{ mimeType: 'image/png' | 'image/jpeg'; dataBase64: string }>;
+  selection?: CodexModelSelection;
+  /** Internal native-creation defaults. Null preserves the native unset effort; never accepted by HTTP routes. */
+  initialModelSettings?: NativeInitialModelSettings;
 }
 
 interface Options { socketPath?: string; timeoutMs?: number; maxFrameBytes?: number }
@@ -89,6 +107,48 @@ interface Entry {
 function object(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+function settingValue(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maxLength
+    && value === value.trim() && !/[\x00-\x1f\x7f]/.test(value);
+}
+
+function selectedCollaborationMode(state: JsonObject, selection: NativeInitialModelSettings): JsonObject {
+  const threadSettings = object(state.latestThreadSettings) ? state.latestThreadSettings : undefined;
+  // Match Desktop's precedence. latestCollaborationMode may omit instructions
+  // that remain present in latestThreadSettings.collaborationMode.
+  const current = threadSettings?.collaborationMode ?? state.latestCollaborationMode;
+  if (!object(current) || !settingValue(current.mode, 64) || !object(current.settings)
+    || (current.settings.developer_instructions !== null && typeof current.settings.developer_instructions !== 'string')) {
+    throw new CodexDesktopIpcError('Codex could not preserve this chat’s model instructions. Refresh the chat before sending.',
+      503, 'not-sent', 'model_settings_unavailable');
+  }
+  const mode = structuredClone(current);
+  mode.settings = { ...mode.settings as JsonObject, model: selection.model, reasoning_effort: selection.reasoningEffort };
+  return mode;
+}
+
+export function readTurnModelEvidence(value: unknown): DesktopTurnModelEvidence | undefined {
+  if (!object(value) || !object(value.params) || !Array.isArray(value.items)) return;
+  const params = value.params;
+  let model = params.model, effort = params.effort;
+  if (params.collaborationMode != null) {
+    const mode = params.collaborationMode;
+    if (!object(mode) || !object(mode.settings)) return;
+    model = mode.settings.model;
+    effort = mode.settings.reasoning_effort;
+    if ((params.model != null && params.model !== model) || (params.effort != null && params.effort !== effort)) return;
+  }
+  if (!settingValue(model, 256) || (effort != null && !settingValue(effort, 64))) return;
+  const reroutes: DesktopTurnModelEvidence['reroutes'] = [];
+  for (const item of value.items) {
+    if (!object(item) || item.type !== 'modelRerouted') continue;
+    // A malformed reroute cannot establish that the original model ran.
+    if (!settingValue(item.fromModel, 256) || !settingValue(item.toModel, 256) || !settingValue(item.reason, 256)) return;
+    reroutes.push({ fromModel: item.fromModel, toModel: item.toModel, reason: item.reason });
+  }
+  return { model, reasoningEffort: typeof effort === 'string' ? effort : null, reroutes };
+}
+
 function target(hostId: string, threadId: string): void {
   if ((hostId !== 'local' && !remoteHostPattern.test(hostId)) || !isThreadId(threadId)) {
     throw new CodexDesktopIpcError('A valid Codex connection and chat are required.', 400);
@@ -400,7 +460,8 @@ export class CodexDesktopIpc {
   async startImageTurn(input: ImageTurn): Promise<ImageTurnReceipt> {
     return this.startMessageTurn({ hostId: input.hostId, threadId: input.threadId,
       clientUserMessageId: input.submissionId, text: input.prompt,
-      attachments: [{ mimeType: 'image/png', dataBase64: input.imageBase64 }] });
+      attachments: [{ mimeType: 'image/png', dataBase64: input.imageBase64 }],
+      ...(input.selection === undefined ? {} : { selection: input.selection }) });
   }
 
   async startMessageTurn(input: MessageTurn): Promise<ImageTurnReceipt> {
@@ -410,6 +471,18 @@ export class CodexDesktopIpc {
       || (!input.text.trim() && input.attachments.length === 0)) {
       throw new CodexDesktopIpcError('A valid message and up to four images are required.', 400);
     }
+    // Parse before awaiting the native snapshot so later draft changes cannot
+    // replace the pair that this call was given. Availability is host-validated upstream.
+    const parsedSelection = input.selection === undefined ? undefined : modelSelectionSchema.safeParse(input.selection);
+    if (parsedSelection && !parsedSelection.success) {
+      throw new CodexDesktopIpcError('Select a valid model and reasoning effort for this connection.', 400, 'not-sent', 'invalid_model_selection');
+    }
+    const parsedInitial = input.initialModelSettings === undefined ? undefined
+      : modelSelectionSchema.extend({ reasoningEffort: modelSelectionSchema.shape.reasoningEffort.nullable() }).safeParse(input.initialModelSettings);
+    if (parsedInitial && (!parsedInitial.success || input.selection !== undefined)) {
+      throw new CodexDesktopIpcError('Codex could not preserve the initial model settings.', 400, 'not-sent', 'invalid_model_selection');
+    }
+    const selection = parsedSelection?.success ? parsedSelection.data : parsedInitial?.success ? parsedInitial.data : undefined;
     try {
       if (input.attachments.reduce((total, image) => total + imageBytes(image.dataBase64, image.mimeType).length, 0) > MAX_ATTACHMENT_BYTES) {
         throw new Error('Attachment limit');
@@ -425,6 +498,7 @@ export class CodexDesktopIpc {
       entry = this.retain(input.hostId, input.threadId);
       const snapshot = await this.refresh(entry);
       if (isDesktopBusy(snapshot.conversationState)) throw new CodexDesktopIpcError('This Codex chat is busy. The message has not been sent.', 409);
+      const collaborationMode = selection ? selectedCollaborationMode(snapshot.conversationState, selection) : undefined;
       // This is a preflight, not an atomic idle guard. Codex turn/start may add
       // input to a turn started elsewhere after this snapshot. The caller must
       // correlate clientUserMessageId and disclose a shared turn when observed.
@@ -435,6 +509,7 @@ export class CodexDesktopIpc {
           request: {
             threadId: input.threadId,
             clientUserMessageId: input.clientUserMessageId,
+            ...(collaborationMode ? { collaborationMode } : {}),
             input: [
               ...(input.text.trim() ? [{ type: 'text', text: input.text, text_elements: [] }] : []),
               ...input.attachments.map(image => ({ type: 'image', url: `data:${image.mimeType};base64,${image.dataBase64}` })),

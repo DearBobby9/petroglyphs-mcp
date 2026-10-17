@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { ConversationError, isCodexHost } from './codex-message-input.js';
@@ -8,8 +8,10 @@ import { isThreadId, type CodexThread, type ThreadPage, type ThreadQuery } from 
 
 export interface SavedCodexProject { id: string; name: string; path: string; hostId: string }
 export interface CreatedProjectThread extends CodexThread { createdAt: number }
+export interface NativeLocalProjectIdentity { projectId: string; rootPaths: string[]; candidateIds: string[] }
 interface State {
   projects: SavedCodexProject[];
+  localProjectRoots: Map<string, unknown[]>;
   assignments: Record<string, unknown>;
   membershipHosts: Record<string, unknown>;
   aliasesByHost: Record<string, unknown>;
@@ -20,6 +22,7 @@ interface Options {
   statePath?: string;
   databasePath?: string;
   requireHost: (hostId: string) => Promise<unknown>;
+  nativeProjectThreads?: (identity: NativeLocalProjectIdentity) => Promise<{ projectId: string; threadIds: string[] }>;
   pageSize?: number;
 }
 const obj = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object'
@@ -37,10 +40,12 @@ export class CodexProjectsCatalog {
   private readonly statePath: string;
   private readonly databasePath: string;
   private readonly pageSize: number;
+  private readonly localMigrationIdentity: string;
 
   constructor(private readonly options: Options) {
     const env = options.env ?? process.env;
     const root = env.CODEX_HOME || join(homedir(), '.codex');
+    this.localMigrationIdentity = `local:${root}`;
     this.statePath = options.statePath ?? join(root, '.codex-global-state.json');
     this.databasePath = options.databasePath ?? join(root, 'sqlite', 'codex-dev.db');
     this.pageSize = options.pageSize ?? 50;
@@ -52,11 +57,13 @@ export class CodexProjectsCatalog {
       if (!info.isFile() || info.size > 16 * 1024 * 1024) throw new Error('Invalid state');
       const state = obj(JSON.parse(await readFile(this.statePath, 'utf8')));
       const projects: SavedCodexProject[] = [];
+      const localProjectRoots = new Map<string, unknown[]>();
       for (const [id, value] of Object.entries(obj(state['local-projects']))) {
         const project = obj(value);
         if (!validProjectId(id) || project.id !== id || typeof project.name !== 'string'
           || !project.name.trim() || !Array.isArray(project.rootPaths) || project.chatGptBacking != null) continue;
         const path = project.rootPaths.find(value => typeof value === 'string' && value.length > 0);
+        localProjectRoots.set(id, project.rootPaths);
         projects.push({ id, name: project.name.slice(0, 500), path: typeof path === 'string' ? path : '', hostId: 'local' });
       }
       if (Array.isArray(state['remote-projects'])) for (const value of state['remote-projects']) {
@@ -66,7 +73,7 @@ export class CodexProjectsCatalog {
           || !project.remotePath || project.chatGptBacking != null) continue;
         projects.push({ id: project.id, name: project.label.slice(0, 500), path: project.remotePath, hostId: project.hostId });
       }
-      return { projects, assignments: obj(state['thread-project-assignments']),
+      return { projects, localProjectRoots, assignments: obj(state['thread-project-assignments']),
         membershipHosts: obj(state['thread-project-membership-host-ids']), aliasesByHost: obj(state['app-server-project-id-by-legacy-project-id-by-host']),
         projectless: new Set(Array.isArray(state['projectless-thread-ids']) ? state['projectless-thread-ids'].filter(isThreadId) : []) };
     } catch { throw new ConversationError('Codex Desktop project definitions are unavailable. Open Codex Desktop and try again.', 503, 'projects_unavailable'); }
@@ -84,6 +91,35 @@ export class CodexProjectsCatalog {
     const project = (await this.list(hostId)).find(project => project.id === projectId);
     if (!project) throw new ConversationError('This saved project is not available on the selected connection. Refresh Projects.', 404, 'project_not_found');
     return project;
+  }
+
+  /** Explicit identity candidates only. The native server must validate the selected identity and every root. */
+  async nativeLocalIdentity(projectId: string): Promise<NativeLocalProjectIdentity> {
+    if (!validProjectId(projectId)) throw new ConversationError('Select a saved Codex project.', 400, 'invalid_project');
+    await this.options.requireHost('local');
+    return this.localIdentity(await this.state(), projectId);
+  }
+
+  private localIdentity(state: State, projectId: string): NativeLocalProjectIdentity {
+    const roots = state.localProjectRoots.get(projectId);
+    if (!roots || roots.length === 0 || roots.some(root => typeof root !== 'string' || !isAbsolute(root))
+      || new Set(roots).size !== roots.length) {
+      throw new ConversationError('This project has no valid local workspace roots. Refresh Projects.', 503, 'project_identity_unavailable');
+    }
+    // Migration keys include CODEX_HOME. An alias from another profile is not
+    // evidence that this app-server owns the same project.
+    const ids = [projectId, obj(state.aliasesByHost.local)[projectId],
+      obj(state.aliasesByHost[this.localMigrationIdentity])[projectId]].filter(validProjectId);
+    return { projectId, rootPaths: roots as string[], candidateIds: [...new Set(ids)] };
+  }
+
+  private async nativeMembership(state: State, project: SavedCodexProject): Promise<Map<string, string>> {
+    if (project.hostId !== 'local' || !this.options.nativeProjectThreads) return new Map();
+    const identity = this.localIdentity(state, project.id);
+    const result = await this.options.nativeProjectThreads(identity);
+    if (!identity.candidateIds.includes(result.projectId) || result.threadIds.some(id => !isThreadId(id))
+      || new Set(result.threadIds).size !== result.threadIds.length) throw new Error('Invalid native project membership');
+    return new Map(result.threadIds.map(id => [id, result.projectId]));
   }
 
   private belongs(state: State, project: SavedCodexProject, threadId: string, serverProjectId: string | null): boolean {
@@ -120,6 +156,7 @@ export class CodexProjectsCatalog {
     if (!project) throw new ConversationError('This saved project is no longer available. Refresh Projects.', 404, 'project_not_found');
     let db: DatabaseSync | undefined;
     try {
+      const nativeMembership = await this.nativeMembership(state, project);
       const { DatabaseSync } = await import('node:sqlite');
       db = new DatabaseSync(this.databasePath, { readOnly: true });
       db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 2000; BEGIN');
@@ -130,7 +167,7 @@ export class CodexProjectsCatalog {
           AND (thread_source IS NULL OR thread_source NOT IN ('chatgpt_hidden', 'ambient_suggestions', 'pull_request_fix_automation'))
         ORDER BY source_updated_at DESC, thread_id DESC`).all(hostId);
       const filtered = rows.map(row => threadSchema.parse(row)).filter(row =>
-        this.belongs(state, project, row.thread_id, row.project_id)
+        this.belongs(state, project, row.thread_id, row.project_id ?? nativeMembership.get(row.thread_id) ?? null)
         && (!search || `${row.display_title}\n${row.cwd ?? ''}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
         && (!cursor || row.source_updated_at < cursor.updatedAt || (row.source_updated_at === cursor.updatedAt && row.thread_id < cursor.threadId)));
       const threads: CodexThread[] = filtered.slice(0, this.pageSize).map(row => ({ id: row.thread_id,
@@ -155,6 +192,7 @@ export class CodexProjectsCatalog {
     if (!project) throw new ConversationError('This saved project is no longer available.', 404, 'project_not_found');
     let db: DatabaseSync | undefined;
     try {
+      const nativeMembership = await this.nativeMembership(state, project);
       const { DatabaseSync } = await import('node:sqlite');
       db = new DatabaseSync(this.databasePath, { readOnly: true });
       db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 2000; BEGIN');
@@ -166,7 +204,7 @@ export class CodexProjectsCatalog {
           AND (thread_source IS NULL OR thread_source NOT IN ('chatgpt_hidden', 'ambient_suggestions', 'pull_request_fix_automation'))
         ORDER BY source_created_at, thread_id`).all(hostId, Math.floor(timestamp / 1000));
       const matches = rows.filter(row => typeof row.thread_id === 'string' && typeof row.source_created_at === 'number'
-        && this.belongs(state, project, row.thread_id, typeof row.project_id === 'string' ? row.project_id : null));
+        && this.belongs(state, project, row.thread_id, typeof row.project_id === 'string' ? row.project_id : nativeMembership.get(row.thread_id) ?? null));
       return { threads: matches.slice(0, 50).map(row => {
         const thread = threadSchema.parse(row);
         return { id: thread.thread_id, title: thread.display_title.trim() || '未命名聊天', cwd: thread.cwd ?? '',
