@@ -1,4 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { CodexDesktopIpcError, readTurnModelEvidence, type CodexDesktopIpc, type DesktopSnapshot } from './codex-desktop-ipc.js';
 import { historyMessages, historyTurns, record, type HistoryTurn } from './codex-conversation-history.js';
@@ -10,6 +13,7 @@ interface Options {
   helperThreadId?: string;
   connect: () => Promise<Pick<CodexDesktopIpc, 'readSnapshot' | 'startMessageTurn' | 'close'>>;
   catalog: Pick<CodexProjectsCatalog, 'require' | 'creationCandidates'>;
+  evidenceDir?: string;
   pollMs?: number;
   confirmationMs?: number;
 }
@@ -172,6 +176,41 @@ function sameFailure(a: ProjectChatRetryProof, b: ProjectChatRetryProof): boolea
   return (Object.keys(a) as Array<keyof ProjectChatRetryProof>).filter(key => key !== 'verifiedAt').every(key => a[key] === b[key]);
 }
 
+const creationEvidenceSchema = z.object({ version: z.literal(1), requestId: z.string().refine(isThreadId),
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/), hostId: z.string(), projectId: z.string(),
+  threadId: z.string().refine(isThreadId), helperTurnId: z.string(), toolCallId: z.string(),
+}).strict();
+type CreationEvidence = z.infer<typeof creationEvidenceSchema>;
+const evidenceFingerprint = (input: ProjectChatExecution) => createHash('sha256').update(JSON.stringify({
+  id: input.id, hostId: input.hostId, projectId: input.projectId, prompt: input.prompt,
+  title: input.title, selection: input.selection, createdAt: input.createdAt, executorThreadId: input.executorThreadId,
+})).digest('hex');
+
+/** Only parse output attached to the exact official call, never assistant text. */
+function officialCreatedThread(call: Record<string, unknown>, input: ProjectChatExecution): string | 'conflict' | undefined {
+  if (call.status !== 'completed' || !matchingArguments(call, input, true)) return;
+  const result = record(call.result);
+  if (!result || result.isError === true) return;
+  const values: unknown[] = [result, result.structuredContent];
+  if (Array.isArray(result.content)) for (const item of result.content) {
+    const content = record(item);
+    if (content?.type === 'text' && typeof content.text === 'string') {
+      try { values.push(JSON.parse(content.text)); } catch { /* Non-JSON tool text carries no identity proof. */ }
+    }
+  }
+  const identities = new Set<string>();
+  for (const value of values) {
+    const output = record(value);
+    if (!output) continue;
+    const id = output.threadId ?? (output.status === 'created' ? output.conversationId : undefined);
+    if (!isThreadId(id)) continue;
+    if (output.hostId !== input.hostId || (output.projectId !== undefined && output.projectId !== input.projectId)
+      || (output.status !== undefined && output.status !== 'created')) return 'conflict';
+    identities.add(id);
+  }
+  return identities.size > 1 ? 'conflict' : [...identities][0];
+}
+
 /** Uses a user-authorized, fixed local chat. It never speaks the private app-tools pipe protocol. */
 export class CodexCompanionCreator implements ProjectChatExecutor {
   readonly executorThreadId?: string;
@@ -179,6 +218,48 @@ export class CodexCompanionCreator implements ProjectChatExecutor {
   private closed = false;
   constructor(private readonly options: Options) {
     this.executorThreadId = isThreadId(options.helperThreadId) ? options.helperThreadId : undefined;
+    if (options.evidenceDir) {
+      if (!isAbsolute(options.evidenceDir)) throw new Error('Companion evidence directory must be absolute');
+      mkdirSync(options.evidenceDir, { recursive: true, mode: 0o700 });
+    }
+  }
+
+  private evidence(input: ProjectChatExecution, value?: CreationEvidence): CreationEvidence | undefined {
+    if (!this.options.evidenceDir) return value;
+    const path = join(this.options.evidenceDir, `${input.id}.json`);
+    if (existsSync(path)) {
+      const saved = creationEvidenceSchema.parse(JSON.parse(readFileSync(path, 'utf8')));
+      if (saved.requestId !== input.id || saved.fingerprint !== evidenceFingerprint(input)
+        || saved.hostId !== input.hostId || saved.projectId !== input.projectId
+        || (value && saved.threadId !== value.threadId)) throw new Error('Conflicting official creation evidence');
+      return saved;
+    }
+    if (value) {
+      writeFileSync(`${path}.tmp`, JSON.stringify(value), { mode: 0o600 });
+      renameSync(`${path}.tmp`, path);
+    }
+    return value;
+  }
+
+  private async recoverTarget(client: Awaited<ReturnType<Options['connect']>>, input: ProjectChatExecution, threadId: string): Promise<ProjectChatObservation> {
+    const catalog = this.options.catalog as Options['catalog'] & Partial<Pick<CodexProjectsCatalog, 'creationTarget'>>;
+    const claimed = catalog.creationTarget ? await catalog.creationTarget(input.hostId, input.projectId, threadId, input.createdAt)
+      : (await catalog.creationCandidates(input.hostId, input.projectId, input.createdAt)).threads.find(thread => thread.id === threadId);
+    if (!claimed || claimed.createdAt < Math.floor(Date.parse(input.createdAt) / 1000)) return { state: 'creating' };
+    const snapshot = await client.readSnapshot(input.hostId, threadId);
+    identity(snapshot, input.hostId, threadId);
+    const history = record(snapshot.conversationState.turnHistory)?.history;
+    if (history && record(history)?.isComplete !== true) return { state: 'creating' };
+    const first = historyTurns(snapshot.conversationState, threadId)[0];
+    if (!first) return { state: 'creating' };
+    if (!firstPromptMatches(first, input)) return { state: 'unknown' };
+    const { createdAt: _created, ...thread } = claimed;
+    const firstMessageId = historyMessages([first]).find(message => message.role === 'user'
+      && (message.text === input.prompt || delegationMatches(message.text, input)))?.id;
+    const modelEvidence = readTurnModelEvidence(first);
+    return { state: 'completed', hostId: input.hostId, thread, firstTurnId: first.id,
+      ...(firstMessageId ? { firstMessageId } : {}), ...(modelEvidence ? { modelEvidence } : {}),
+      ...(first.status === 'failed' ? { notice: 'The chat was created, but its first response failed. Continue in this chat instead of creating another one.' } : {}) };
   }
 
   async ready(): Promise<void> {
@@ -233,6 +314,8 @@ export class CodexCompanionCreator implements ProjectChatExecutor {
     const readDeadline = setTimeout(() => client.close(), 15_000);
     readDeadline.unref();
     try {
+      const saved = this.evidence(input);
+      if (saved) return await this.recoverTarget(client, input, saved.threadId);
       const helper = await client.readSnapshot('local', input.executorThreadId);
       identity(helper, 'local', input.executorThreadId);
       const turns = historyTurns(helper.conversationState, input.executorThreadId);
@@ -254,6 +337,15 @@ export class CodexCompanionCreator implements ProjectChatExecutor {
       if (turn.status === 'inProgress') return { state: 'creating' };
       const users = turn.items.filter(item => item.type === 'userMessage');
       if (users.length !== 1 || userText(users[0]) !== projectCreationEnvelope(input)) return { state: 'unknown' };
+      const calls = directCreateCalls(turn);
+      if (calls.length > 1 || calls.some(call => !matchingArguments(call, input))) return { state: 'unknown' };
+      const official = calls.length === 1 ? officialCreatedThread(calls[0], input) : undefined;
+      if (official === 'conflict') return { state: 'unknown' };
+      if (official && typeof calls[0].id === 'string') {
+        this.evidence(input, { version: 1, requestId: input.id, fingerprint: evidenceFingerprint(input),
+          hostId: input.hostId, projectId: input.projectId, threadId: official, helperTurnId: turn.id, toolCallId: calls[0].id });
+        return await this.recoverTarget(client, input, official);
+      }
       const finals = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'final_answer' && typeof item.text === 'string');
       if (finals.length !== 1) return { state: 'unknown' };
       const final = finalReceipt(finals[0].text as string);
@@ -262,8 +354,6 @@ export class CodexCompanionCreator implements ProjectChatExecutor {
         || final.attemptId !== input.retry?.attemptId) {
         return { state: 'unknown' };
       }
-      const calls = directCreateCalls(turn);
-      if (calls.length > 1 || calls.some(call => !matchingArguments(call, input))) return { state: 'unknown' };
       const candidates = await this.options.catalog.creationCandidates(input.hostId, input.projectId, input.createdAt);
       if (candidates.truncated) return { state: 'unknown' };
       if (final.status === 'unknown') {

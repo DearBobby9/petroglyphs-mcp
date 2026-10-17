@@ -204,7 +204,8 @@ export class RemoteHosts {
         requireSelection,
         localExecutor: new CodexNativeCreator({ dataDir: join(settings.dataDir, 'project-chats', 'native'), codexPath: nativeCodexPath,
           env, catalog: projects, connectNative, connectDesktop: connect }),
-        executor: new CodexCompanionCreator({ helperThreadId: env.PETROGLYPHS_CODEX_CREATOR_THREAD_ID, connect, catalog: projects }) });
+        executor: new CodexCompanionCreator({ helperThreadId: env.PETROGLYPHS_CODEX_CREATOR_THREAD_ID, connect, catalog: projects,
+          evidenceDir: join(settings.dataDir, 'project-chats', 'companion-evidence') }) });
       const requireTarget = async (hostId: string, threadId: string) => {
         if (projectChats.hasThread(hostId, threadId)) { await requireHost(hostId); return; }
         return hostId === 'local' ? localThreads.requireThread(threadId) : catalog.requireThread(hostId, threadId);

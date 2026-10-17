@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { CodexCompanionCreator, ProjectCreationNotSentError, projectCreationEnvelope } from '../src/codex-companion-creator.ts';
 import { CodexDesktopIpcError } from '../src/codex-desktop-ipc.ts';
@@ -16,7 +19,7 @@ const state = (threadId, turns) => ({ id: threadId, turns: [], turnHistory: { hi
 const wrapped = (input, source = helper) => ['<codex_delegation>', `  <source_thread_id>${source}</source_thread_id>`,
   `  <input>${input.prompt.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}</input>`, '</codex_delegation>'].join('\n');
 
-function fixture(t, style = 'text', overrides = {}) {
+function fixture(t, style = 'text', overrides = {}, creatorOptions = {}) {
   const input = { id: randomUUID(), hostId: remote, projectId: 'saved-remote-project', prompt: 'Explain A < B & C > D.',
     title: 'User title', createdAt: new Date(now).toISOString(), executorThreadId: helper,
     requestPath: '/private/service/requests/immutable.json', ...overrides };
@@ -50,7 +53,10 @@ function fixture(t, style = 'text', overrides = {}) {
     }, async creationCandidates(hostId, projectId, since) {
       assert.equal(hostId, input.hostId); assert.equal(projectId, input.projectId); assert.equal(since, input.createdAt);
       return { threads: candidates, truncated: controls.truncated };
-    } } });
+    }, async creationTarget(hostId, projectId, id, since) {
+      assert.equal(hostId, input.hostId); assert.equal(projectId, input.projectId); assert.equal(since, input.createdAt);
+      return candidates.find(thread => thread.id === id);
+    } }, ...creatorOptions });
   t.after(() => creator.close());
   return { creator, input, threadId, finalObject, finalText, answer, helperTurn, firstTurn, snapshots, candidates, controls, calls };
 }
@@ -71,6 +77,49 @@ test('configured companion sends one fixed local instruction and verifies a remo
   await f.creator.recoverChat(f.input); assert.equal(f.calls.length, 1);
   const missing = new CodexCompanionCreator({ connect: async () => { throw new Error('Must not connect'); }, catalog: {} });
   await assert.rejects(missing.ready(), ProjectCreationNotSentError); missing.close();
+});
+
+const officialResult = f => ({ id: `create-${randomUUID()}`, type: 'mcpToolCall', server: 'codex_app', tool: 'create_thread', status: 'completed',
+  arguments: { prompt: f.input.prompt, title: f.input.title,
+    target: { type: 'project', projectId: f.input.projectId, environment: { type: 'local' } },
+    ...(f.input.selection ? { model: f.input.selection.model, thinking: f.input.selection.reasoningEffort } : {}) },
+  result: { content: [{ type: 'text', text: JSON.stringify({ status: 'created', threadId: f.threadId, hostId: f.input.hostId }) }] } });
+
+test('an official result recovers only its target despite empty, unreadable and many later candidates', async t => {
+  const f = fixture(t);
+  f.helperTurn.items.push(officialResult(f));
+  const empty = randomUUID();
+  f.candidates.push({ ...f.candidates[0], id: empty });
+  f.snapshots.set(`${f.input.hostId}:${empty}`, state(empty, []));
+  f.candidates.push(...Array.from({ length: 60 }, () => ({ ...f.candidates[0], id: randomUUID() })));
+  f.controls.truncated = true;
+  const result = await f.creator.recoverChat(f.input);
+  assert.equal(result.state, 'completed');
+  assert.equal(result.thread.id, f.threadId);
+  assert.deepEqual(f.controls.reads.map(([, id]) => id), [helper, f.threadId]);
+  assert.equal(f.calls.length, 0);
+});
+
+test('conflicting official results remain uncertain even when the assistant names a valid target', async t => {
+  const f = fixture(t);
+  const result = officialResult(f);
+  result.result.structuredContent = { status: 'created', threadId: randomUUID(), hostId: f.input.hostId };
+  f.helperTurn.items.push(result);
+  assert.equal((await f.creator.recoverChat(f.input)).state, 'unknown');
+});
+
+test('official creation identity is durable before target history is available', async t => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'petroglyphs-creation-proof-'));
+  t.after(() => rmSync(evidenceDir, { recursive: true, force: true }));
+  const f = fixture(t, 'text', {}, { evidenceDir });
+  f.helperTurn.items.push(officialResult(f));
+  const target = f.snapshots.get(`${f.input.hostId}:${f.threadId}`);
+  f.snapshots.delete(`${f.input.hostId}:${f.threadId}`);
+  await assert.rejects(f.creator.recoverChat(f.input), /Unavailable native snapshot/);
+  f.snapshots.set(`${f.input.hostId}:${f.threadId}`, target);
+  f.snapshots.delete(`local:${helper}`);
+  assert.equal((await f.creator.recoverChat(f.input)).state, 'completed');
+  assert.equal(f.calls.length, 0);
 });
 
 test('official delegated user text and turnToolOutput both verify without forwarding the wrapper as user content', async t => {

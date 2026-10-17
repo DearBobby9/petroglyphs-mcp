@@ -183,7 +183,12 @@ export class CodexProjectsCatalog {
   }
 
   /** Bounded native evidence for creation reconciliation; never a cwd search. */
-  async creationCandidates(hostId: string, projectId: string, since: string): Promise<{ threads: CreatedProjectThread[]; truncated: boolean }> {
+  async creationTarget(hostId: string, projectId: string, threadId: string, since: string): Promise<CreatedProjectThread | undefined> {
+    if (!isThreadId(threadId)) throw new ConversationError('Invalid created chat identity.', 400, 'invalid_chat_request');
+    return (await this.creationCandidates(hostId, projectId, since, threadId)).threads[0];
+  }
+
+  async creationCandidates(hostId: string, projectId: string, since: string, threadId?: string): Promise<{ threads: CreatedProjectThread[]; truncated: boolean }> {
     const timestamp = Date.parse(since);
     if (!Number.isFinite(timestamp)) throw new ConversationError('Invalid creation time.', 400, 'invalid_chat_request');
     await this.options.requireHost(hostId);
@@ -200,9 +205,10 @@ export class CodexProjectsCatalog {
       if (sync?.initial_build_complete !== 1) throw new Error('Incomplete catalog');
       const rows = db.prepare(`SELECT thread_id, display_title, cwd, source_updated_at, source_created_at, project_id
         FROM local_thread_catalog WHERE host_id = ? AND source_created_at >= ? AND missing_candidate = 0
+          AND (? IS NULL OR thread_id = ?)
           AND source_kind NOT IN ('chatgpt', 'exec')
           AND (thread_source IS NULL OR thread_source NOT IN ('chatgpt_hidden', 'ambient_suggestions', 'pull_request_fix_automation'))
-        ORDER BY source_created_at, thread_id`).all(hostId, Math.floor(timestamp / 1000));
+        ORDER BY source_created_at, thread_id`).all(hostId, Math.floor(timestamp / 1000), threadId ?? null, threadId ?? null);
       const matches = rows.filter(row => typeof row.thread_id === 'string' && typeof row.source_created_at === 'number'
         && this.belongs(state, project, row.thread_id, typeof row.project_id === 'string' ? row.project_id : nativeMembership.get(row.thread_id) ?? null));
       return { threads: matches.slice(0, 50).map(row => {
