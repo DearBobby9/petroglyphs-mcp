@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isDesktopBusy } from './codex-desktop-ipc.js';
 import { ConversationError } from './codex-message-input.js';
 import type { SubmissionState } from './codex-replies.js';
+import { resultImageInputs, type ResultImageUnavailableReason } from './codex-result-images.js';
 
 export interface ConversationAttachment {
   id: string;
@@ -10,6 +11,7 @@ export interface ConversationAttachment {
   availability: 'available' | 'unavailable';
   byteCount?: number;
   assetPath?: string;
+  unavailableReason?: ResultImageUnavailableReason;
 }
 export interface ConversationMessage {
   id: string;
@@ -21,6 +23,7 @@ export interface ConversationMessage {
   createdAt: string | null;
   state: SubmissionState | 'cancelled';
   attachments: ConversationAttachment[];
+  omittedAttachmentCount?: number;
 }
 export interface HistoryMessage extends ConversationMessage {
   /** Never exposed directly: only data URLs may be converted into paired assets. */
@@ -89,13 +92,15 @@ export function historyMessages(turns: HistoryTurn[]): HistoryMessage[] {
     const state: SubmissionState = turn.status === 'inProgress' ? 'running' : turn.status === 'completed' ? 'completed'
       : turn.status === 'failed' ? 'failed' : 'unknown';
     for (const [index, item] of turn.items.entries()) {
-      if (item.type !== 'userMessage' && item.type !== 'agentMessage') continue;
+      const resultImages = resultImageInputs(item);
+      if (item.type !== 'userMessage' && item.type !== 'agentMessage' && resultImages.length === 0) continue;
       const user = item.type === 'userMessage';
-      if (!user && typeof item.text !== 'string') continue;
-      if (!user && item.phase !== undefined && item.phase !== null
+      if (!user && item.type === 'agentMessage' && typeof item.text !== 'string' && resultImages.length === 0) continue;
+      if (!user && item.type === 'agentMessage' && item.phase !== undefined && item.phase !== null
         && item.phase !== 'commentary' && item.phase !== 'final_answer') continue;
       const content = user && Array.isArray(item.content) ? item.content.map(record).filter((value): value is Record<string, unknown> => !!value) : [];
-      const sourceText = user ? content.filter(value => value.type === 'text' && typeof value.text === 'string').map(value => value.text).join('\n') : item.text as string;
+      const sourceText = user ? content.filter(value => value.type === 'text' && typeof value.text === 'string').map(value => value.text).join('\n')
+        : item.type === 'agentMessage' && typeof item.text === 'string' ? item.text : '';
       const drawing = user ? drawingText(sourceText) : { text: sourceText };
       const rawId = typeof item.id === 'string' ? item.id : `position-${index}`;
       const id = createHash('sha256').update(`${turn.id}\0${rawId}`).digest('hex');
@@ -104,9 +109,10 @@ export function historyMessages(turns: HistoryTurn[]): HistoryMessage[] {
         : userItems.length === 1 && typeof turn.params?.clientUserMessageId === 'string' ? turn.params.clientUserMessageId
           : typeof item.id === 'string' ? item.id : undefined) : undefined;
       messages.push({ id, turnId: turn.id, ...(clientMessageId ? { clientMessageId } : {}), role: user ? 'user' : 'assistant',
-        text: drawing.text, phase: user ? 'user' : item.phase === 'commentary' || item.phase === 'final_answer' ? item.phase : 'unknown',
+        text: drawing.text, phase: user ? 'user' : item.type !== 'agentMessage' ? 'final_answer'
+          : item.phase === 'commentary' || item.phase === 'final_answer' ? item.phase : 'unknown',
         createdAt: timestamp(item.createdAt ?? item.timestamp) ?? turn.createdAt, state, attachments: [],
-        imageInputs: content.filter(value => value.type === 'image' || value.type === 'localImage'),
+        imageInputs: user ? content.filter(value => value.type === 'image' || value.type === 'localImage') : resultImages,
         ...(drawing.id ? { legacyDrawingId: drawing.id } : {}),
       });
     }

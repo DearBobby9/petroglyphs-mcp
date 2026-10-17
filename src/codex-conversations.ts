@@ -3,6 +3,7 @@ import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileS
 import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { performance } from 'node:perf_hooks';
+import { CodexResultImages, stripResultImageSources, type ResultImageInput } from './codex-result-images.js';
 import { CodexDesktopIpcError, readTurnModelEvidence, type CodexModelSelection, type DesktopTurnModelEvidence, type MessageTurn } from './codex-desktop-ipc.js';
 import { modelSelectionSchema, modelEvidenceSchema, modelVerificationFor, type ModelVerification } from './codex-model-selection.js';
 import { ConversationError, imageBytes, isCodexHost, messageFingerprint, parseMessageInput, type MessageInput } from './codex-message-input.js';
@@ -77,6 +78,7 @@ export class CodexConversations {
   private projectionBytes = 0;
   private readonly jobsDir: string;
   private readonly assetsDir: string;
+  private readonly resultImages: CodexResultImages;
   private connection?: Promise<ConversationConnection>;
   private draining?: Promise<void>;
   private closed = false;
@@ -89,6 +91,7 @@ export class CodexConversations {
     this.assetsDir = join(options.dataDir, 'assets');
     mkdirSync(this.jobsDir, { recursive: true, mode: 0o700 });
     mkdirSync(this.assetsDir, { recursive: true, mode: 0o700 });
+    this.resultImages = new CodexResultImages({ dataDir: options.dataDir });
     for (const filename of readdirSync(this.assetsDir).filter(name => /^[a-f0-9]{64}\.json$/.test(name))) {
       const asset = assetSchema.parse(JSON.parse(readFileSync(join(this.assetsDir, filename), 'utf8')));
       if (filename !== `${asset.id}.json`) throw new Error('Invalid conversation asset');
@@ -393,10 +396,17 @@ export class CodexConversations {
     } catch { return; }
   }
 
-  private publicMessage(message: HistoryMessage, hostId: string, threadId: string): ConversationMessage {
+  private publicMessage(message: HistoryMessage, hostId: string, threadId: string, cwd?: string): ConversationMessage {
     const { imageInputs, legacyDrawingId, ...safe } = message;
+    if (message.role === 'assistant') safe.text = stripResultImageSources(message.text);
     const job = message.clientMessageId ? this.jobs.get(message.clientMessageId) : undefined;
     if (job && job.hostId === hostId && job.threadId === threadId) return { ...safe, ...this.message(job), id: message.id };
+    if (message.role === 'assistant' && imageInputs.length) {
+      const result = this.resultImages.attachments({ hostId, threadId, messageId: message.id, cwd, inputs: imageInputs as ResultImageInput[] },
+        (name, mimeType, bytes) => this.attachment(this.persistAsset(hostId, threadId, name, mimeType, bytes)));
+      return { ...safe, text: stripResultImageSources(message.text), attachments: result.attachments,
+        ...(result.omittedAttachmentCount > 0 ? { omittedAttachmentCount: result.omittedAttachmentCount } : {}) };
+    }
     const legacy = this.legacyAsset(message, hostId, threadId);
     if (legacy) return { ...safe, attachments: [legacy] };
     const inputs = imageInputs.length > 0 ? imageInputs : legacyDrawingId ? [{}] : [];
@@ -431,6 +441,8 @@ export class CodexConversations {
       } catch { throw new ConversationError('The history cursor does not match the selected chat. Refresh the conversation.', 400, 'invalid_cursor'); }
     }
     const snapshot = await this.read(hostId, threadId);
+    const nativeCwd = record(snapshot.state)?.cwd;
+    const cwd = typeof nativeCwd === 'string' && isAbsolute(nativeCwd) ? nativeCwd : undefined;
     const jobs = [...this.jobs.values()].filter(job => job.hostId === hostId && job.threadId === threadId);
     const observed = new Set(snapshot.messages.map(message => message.clientMessageId));
     const messages: Array<HistoryMessage | ConversationMessage> = [...snapshot.messages];
@@ -442,7 +454,7 @@ export class CodexConversations {
     const end = before ? messages.findIndex(message => message.id === before!.id) : messages.length;
     if (end < 0) throw new ConversationError('This history page changed. Refresh the conversation.', 409, 'stale_cursor');
     const start = Math.max(0, end - limit);
-    const page = messages.slice(start, end).map(message => 'imageInputs' in message ? this.publicMessage(message, hostId, threadId) : message);
+    const page = messages.slice(start, end).map(message => 'imageInputs' in message ? this.publicMessage(message, hostId, threadId, cwd) : message);
     const receipts = jobs.filter((job, index) => unfinished(job) || index >= jobs.length - 50).map(job => this.receipt(job));
     const first = this.options.verifiedFirstMessage?.(hostId, threadId);
     if (first?.selection && !receipts.some(receipt => receipt.id === first.id)) {
@@ -453,7 +465,7 @@ export class CodexConversations {
         // Creation can be confirmed before its response finishes. Derive this
         // receipt on every history read so a later native reroute stays visible.
         receipts.push({ id: first.id, hostId, threadId, createdAt: first.createdAt, updatedAt: new Date().toISOString(),
-          turnId: turn.id, state: message.state, message: this.publicMessage(message, hostId, threadId),
+          turnId: turn.id, state: message.state, message: this.publicMessage(message, hostId, threadId, cwd),
           selection: { ...first.selection }, modelVerification: modelVerificationFor(first.selection, evidence, true),
           ...(evidence ? { modelEvidence: evidence } : {}) });
       }

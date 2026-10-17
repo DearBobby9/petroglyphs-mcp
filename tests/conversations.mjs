@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -434,6 +434,34 @@ test('legacy drawing prompts become image messages without removing ordinary use
   assert.equal(users[0].attachments[0].availability, 'available');
   assert.equal(users[1].text, `${submissionMarker(id)}This is ordinary text.`);
   assert.equal(users.length, 2);
+});
+
+test('assistant result images become pinned paired assets without exposing source data', async t => {
+  const f = await fixture(t);
+  const turn = nativeTurn(randomUUID(), 'Image result');
+  const generated = { id: randomUUID(), type: 'imageGeneration', result: png, status: 'completed' };
+  const markdown = { id: randomUUID(), type: 'agentMessage', text: `Rendered: ![Mockup](${`data:image/png;base64,${png}`})`, phase: 'final_answer' };
+  turn.items.push(generated, markdown);
+  f.turns.set(`${host}:${thread}`, [turn]);
+
+  let page = await f.service.conversation(host, thread);
+  const imageMessage = page.messages.find(message => message.id === createHash('sha256').update(`${turn.turnId}\0${generated.id}`).digest('hex'));
+  assert.equal(imageMessage.attachments[0].availability, 'available');
+  const assetId = imageMessage.attachments[0].assetPath.split('/').at(-1).split('?')[0];
+  assert.deepEqual(f.service.asset(host, thread, assetId).bytes, Buffer.from(png, 'base64'));
+  const rendered = page.messages.find(message => message.id === createHash('sha256').update(`${turn.turnId}\0${markdown.id}`).digest('hex'));
+  assert.equal(rendered.text, 'Rendered: [Image: Mockup]');
+  assert.equal(rendered.attachments[0].availability, 'available');
+  const serialized = JSON.stringify(page);
+  assert(!serialized.includes('data:image'));
+  assert(!serialized.includes('/tmp/'));
+
+  generated.result = Buffer.from(png, 'base64').map((byte, index) => index === 30 ? byte ^ 1 : byte).toString('base64');
+  const restored = f.restart();
+  page = await restored.conversation(host, thread);
+  const pinned = page.messages.find(message => message.id === imageMessage.id).attachments[0];
+  assert.equal(pinned.assetPath, imageMessage.attachments[0].assetPath);
+  assert.deepEqual(restored.asset(host, thread, assetId).bytes, Buffer.from(png, 'base64'));
 });
 
 test('history is chronological and bounded, hides internal events, serves only safe image assets and scopes cursors', async t => {
